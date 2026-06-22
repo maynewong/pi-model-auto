@@ -19,7 +19,9 @@ Then select **Pi Router (Auto)** with `/model`.
 ## What it does
 
 - Builds a zero-config model pool from `ctx.modelRegistry.getAvailable()`.
-- Uses the cheapest authenticated model as `cheap` and the most expensive as `strong` by default.
+- Normalizes provider SKUs to canonical model names such as `gpt-5.5`, `glm-5.2`, and `deepseek-v4-flash`.
+- Uses canonical metadata, not alphabetical order or missing provider prices, to build cheap / standard / strong / unknown pools.
+- Selects within the strong pool by request profile: `deep`, `fast`, `coder`, `balanced`, `vision`, or `frontier`.
 - Lets you pin `cheap` / `strong` explicitly for dogfooding custom model pools.
 - Falls back to transparent single-model routing if only one model is authenticated.
 - Applies hard constraints for:
@@ -49,6 +51,8 @@ Optional config files:
 - `~/.pi/agent/model-router.json`
 - `.pi/model-router.json` in trusted projects
 
+No config is required for covered canonical models.
+
 ```jsonc
 {
   "router": {
@@ -76,7 +80,7 @@ When `log` is true, routing decisions are appended to `.pi/router.log`.
 
 ## Debug
 
-Use the command below inside Pi to inspect the current pool and last routing decision:
+Use the command below inside Pi to inspect cheap / standard / strong / unknown pools plus the last routing decision, including canonical key, cost tier, profile, confidence, reason, and alternatives:
 
 ```text
 /router
@@ -88,6 +92,8 @@ Use the command below inside Pi to inspect the current pool and last routing dec
 pi-model-router/
 ├── package.json      # Pi package manifest
 ├── src/index.ts      # Extension entry
+├── src/router-core.ts
+├── src/canonical-models.ts
 ├── tsconfig.json
 └── README.md
 ```

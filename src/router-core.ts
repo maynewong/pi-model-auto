@@ -40,6 +40,11 @@ export interface ModelOverride {
   frontier?: boolean;
 }
 
+export interface ModelFilter {
+  include: string[];
+  exclude: string[];
+}
+
 export interface RouterConfig {
   threshold: number;
   weights: {
@@ -51,6 +56,8 @@ export interface RouterConfig {
   };
   log: boolean;
   tierModels: Partial<Record<Tier, string>>;
+  /** Restrict the automatically built pool by provider/id/name/canonical substring. Empty include means allow all. */
+  modelFilter: ModelFilter;
   /** User-supplied metadata for unknown/private/local models. Keys may be provider/id, model id, or normalized model id. */
   modelOverrides: Record<string, ModelOverride>;
   forceStrongOnHighReasoning: boolean;
@@ -82,6 +89,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
   },
   log: false,
   tierModels: {},
+  modelFilter: { include: [], exclude: [] },
   modelOverrides: {},
   forceStrongOnHighReasoning: false,
 };
@@ -127,6 +135,7 @@ export function buildAutoPool(models: Model<Api>[], cfg: RouterConfig = DEFAULT_
     .filter((model) => model.provider !== "pi-router")
     .filter((model) => model.input?.includes("text"))
     .map((model) => resolveModel(model, cfg))
+    .filter((model) => matchesModelFilter(model, cfg.modelFilter))
     .sort(compareResolvedModels);
 
   return {
@@ -181,6 +190,34 @@ export function findModelOverride(
     if (override) return override;
   }
   return undefined;
+}
+
+export function matchesModelFilter(item: ResolvedModel, filter: ModelFilter): boolean {
+  const include = filter.include.map(normalizeFilterPattern).filter(Boolean);
+  const exclude = filter.exclude.map(normalizeFilterPattern).filter(Boolean);
+  const haystack = modelFilterHaystack(item);
+
+  if (exclude.some((pattern) => haystack.includes(pattern))) return false;
+  if (include.length === 0) return true;
+  return include.some((pattern) => haystack.includes(pattern));
+}
+
+function normalizeFilterPattern(pattern: string): string {
+  return pattern.trim().toLowerCase();
+}
+
+function modelFilterHaystack(item: ResolvedModel): string {
+  return [
+    modelKey(item.model),
+    item.model.provider,
+    item.model.id,
+    item.model.name,
+    item.canonicalKey,
+    normalizeModelKey(modelKey(item.model)),
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
 }
 
 export function decide(

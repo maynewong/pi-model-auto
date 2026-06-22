@@ -49,6 +49,34 @@ describe("canonical model routing", () => {
     ]);
   });
 
+  it("filters models by provider/id/name/canonical substring", () => {
+    const pool = buildAutoPool(
+      [
+        model("deepseek", "deepseek-v4-flash"),
+        model("magi", "deepseek-v4-flash"),
+        model("magi-codex", "gpt-5.5"),
+        model("openai-codex", "gpt-5.5"),
+      ],
+      { ...DEFAULT_CONFIG, modelFilter: { include: ["magi"], exclude: [] } },
+    );
+
+    expect(pool.all.map((item) => `${item.model.provider}/${item.model.id}`)).toEqual([
+      "magi/deepseek-v4-flash",
+      "magi-codex/gpt-5.5",
+    ]);
+    expect(pool.cheapPool.map((item) => item.model.provider)).toEqual(["magi"]);
+    expect(pool.strongPool.map((item) => item.model.provider)).toEqual(["magi-codex"]);
+  });
+
+  it("applies exclude after include", () => {
+    const pool = buildAutoPool(
+      [model("magi-codex", "gpt-5.5"), model("magi", "glm-5.2")],
+      { ...DEFAULT_CONFIG, modelFilter: { include: ["magi"], exclude: ["codex"] } },
+    );
+
+    expect(pool.all.map((item) => `${item.model.provider}/${item.model.id}`)).toEqual(["magi/glm-5.2"]);
+  });
+
   it("keeps unknown models out of cheap/strong inferred pools", () => {
     const pool = buildAutoPool([model("local", "Qwen3.6-35B-A3B-UD-MLX-4bit")]);
     expect(pool.cheapPool).toHaveLength(0);

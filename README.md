@@ -64,6 +64,10 @@ No config is required for covered canonical models.
       "reasoning": 0.15,
       "toolDensity": 0.10
     },
+    "modelFilter": {
+      "include": ["magi"],
+      "exclude": []
+    },
     "models": {
       "cheap": "magi/deepseek-v4-flash",
       "strong": "magi/gpt-5.4"
@@ -81,6 +85,8 @@ No config is required for covered canonical models.
   }
 }
 ```
+
+`modelFilter` is optional. Use `include` / `exclude` substring filters to restrict the automatically built pool by provider, model id, display name, or canonical key. Empty `include` means allow all; `exclude` wins over `include`.
 
 `models` is optional. Use it when catalog prices do not match your actual quality/cost preferences.
 

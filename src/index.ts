@@ -263,7 +263,7 @@ function updateRouterStatus(ctx: ExtensionContext, text: string) {
 }
 
 function shortStatus(decision: LastDecision): string {
-  return `🧭 ${decision.chosen.split("/").at(-1) ?? decision.chosen} · ${decision.costTier}`;
+  return `🧭 ${decision.chosen} · ${decision.costTier}`;
 }
 
 function isRouterModel(model: Model<Api> | undefined): boolean {

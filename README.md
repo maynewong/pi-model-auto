@@ -81,6 +81,13 @@ No config is required for covered canonical models.
       }
     },
     "forceStrongOnHighReasoning": false,
+    "quota": {
+      "enabled": true,
+      "reserveRatio": 0.05,
+      "inTurnRetry": false,
+      "maxRetries": 2,
+      "defaultCooldownMs": 300000
+    },
     "log": false
   }
 }
@@ -99,9 +106,21 @@ No config is required for covered canonical models.
 
 When `log` is true, routing decisions are appended to `.pi/router.log`.
 
+## Quota-aware routing
+
+Quota-aware routing is enabled by default. The router records rate-limit signals from response headers and `429` responses, then skips cooling plan identities on later automatic turns until the reset window has passed. A plan identity is `provider + baseUrl + hashed auth identity`, so API-paid and subscription-backed models under the same provider do not cool each other down when their credentials or upstream URL differ. Cooldown state is persisted in `~/.pi/agent/quota-state.json`, so a five-hour provider window survives Pi restarts.
+
+Forced routes such as `@model:provider/id`, `@cheap`, and `@strong` bypass quota filtering because the user explicitly requested that route. If the forced provider is rate-limited, the provider error is allowed to surface.
+
+Known MVP limits:
+
+- OAuth/subscription providers may not expose remaining quota headers, so they cool down only after a real `429`.
+- Soft cooldown depends on provider header units being comparable within the same provider.
+- The router does not estimate or accumulate token spend on its own.
+
 ## Debug
 
-Use the command below inside Pi to inspect cheap / standard / strong / unknown pools plus the last routing decision, including canonical key, cost tier, profile, confidence, reason, and alternatives:
+Use the command below inside Pi to inspect cheap / standard / strong / unknown pools, quota plan state, and the last routing decision, including canonical key, cost tier, profile, confidence, reason, and alternatives:
 
 ```text
 /router
@@ -114,6 +133,7 @@ pi-model-router/
 ├── package.json      # Pi package manifest
 ├── src/index.ts      # Extension entry
 ├── src/router-core.ts
+├── src/quota.ts
 ├── src/canonical-models.ts
 ├── tsconfig.json
 └── README.md

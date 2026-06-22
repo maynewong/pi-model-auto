@@ -355,13 +355,40 @@ export function lastUserText(context: Context): string {
   for (let i = context.messages.length - 1; i >= 0; i--) {
     const message = context.messages[i];
     if (message.role !== "user") continue;
-    if (typeof message.content === "string") return message.content;
-    return message.content
-      .filter((part) => part.type === "text")
-      .map((part) => part.text)
-      .join("\n");
+    return userMessageText(message);
   }
   return "";
+}
+
+export function routingTurnKey(context: Context): string {
+  let userCount = 0;
+  let lastText = "";
+
+  for (const message of context.messages) {
+    if (message.role !== "user") continue;
+    userCount += 1;
+    lastText = userMessageText(message);
+  }
+
+  return `${userCount}:${stableHash(lastText)}`;
+}
+
+export function shouldReuseTurnSelection(context: Context): boolean {
+  return context.messages.at(-1)?.role === "toolResult";
+}
+
+function userMessageText(message: Extract<Context["messages"][number], { role: "user" }>): string {
+  if (typeof message.content === "string") return message.content;
+  return message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function stableHash(text: string): string {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash) ^ text.charCodeAt(i);
+  return (hash >>> 0).toString(36);
 }
 
 export function estimateContextTokens(context: Context): number {

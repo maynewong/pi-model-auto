@@ -24,11 +24,14 @@ import {
   matchesModelFilter,
   modelKey,
   resolveModel,
+  routingTurnKey,
   selectFromPool,
+  shouldReuseTurnSelection,
   type Decision,
   type Pool,
   type ResolvedModel,
   type RouterConfig,
+  type Selection,
   type Tier,
 } from "./router-core.ts";
 
@@ -58,6 +61,7 @@ export default function modelRouter(pi: ExtensionAPI) {
   let pool: Pool = { cheapPool: [], strongPool: [], standardPool: [], unknownPool: [], all: [] };
   let forcedRoute: ForcedRoute | undefined;
   let lastDecision: LastDecision | undefined;
+  let turnSelection: { key: string; selection: Selection } | undefined;
   let providerRegistered = false;
 
   pi.registerCommand("router", {
@@ -71,6 +75,7 @@ export default function modelRouter(pi: ExtensionAPI) {
     extCtx = ctx;
     cfg = loadConfig(ctx);
     pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable(), cfg), cfg, ctx);
+    turnSelection = undefined;
 
     const api = `pi-router-api:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     if (providerRegistered) pi.unregisterProvider("pi-router");
@@ -109,6 +114,7 @@ export default function modelRouter(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     forcedRoute = undefined;
     lastDecision = undefined;
+    turnSelection = undefined;
     extCtx = undefined;
   });
 
@@ -134,8 +140,16 @@ export default function modelRouter(pi: ExtensionAPI) {
         }
 
         const decision = decide(context, options, forcedRoute, cfg);
-        const selection = selectModel(decision, pool, context, options, ctx, cfg);
+        const turnKey = routingTurnKey(context);
+        const cachedSelection = turnSelection;
+        const reuseTurnSelection =
+          decision.cls !== "model" && shouldReuseTurnSelection(context) && cachedSelection?.key === turnKey;
+        const selection = reuseTurnSelection
+          ? { ...cachedSelection.selection, reason: `${cachedSelection.selection.reason}; reused within user turn` }
+          : selectModel(decision, pool, context, options, ctx, cfg);
         const target = selection.selected.model;
+
+        if (decision.cls !== "model") turnSelection = { key: turnKey, selection };
 
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(target);
         if (!auth.ok) throw new Error(auth.error);

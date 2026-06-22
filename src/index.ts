@@ -94,12 +94,15 @@ export default function modelRouter(pi: ExtensionAPI) {
       streamSimple,
     });
 
-    ctx.ui.setStatus(
-      "router",
-      pool.all.length === 0
-        ? "🧭 router: no authenticated models"
-        : `🧭 router ready (${pool.all.length} model${pool.all.length === 1 ? "" : "s"})`,
-    );
+    updateRouterStatus(ctx, pool.all.length === 0 ? "🧭 no models" : "🧭 ready");
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    if (isRouterModel(event.model)) {
+      updateRouterStatus(ctx, lastDecision ? shortStatus(lastDecision) : "🧭 ready");
+    } else {
+      ctx.ui.setStatus("router", undefined);
+    }
   });
 
   pi.on("session_shutdown", async () => {
@@ -152,10 +155,7 @@ export default function modelRouter(pi: ExtensionAPI) {
           alternatives: selection.alternatives,
         };
 
-        ctx.ui.setStatus(
-          "router",
-          `🧭 router → ${target.id} (${selection.selected.canonicalKey ?? "unknown"}; ${selection.selected.costTier}; ${selection.profile}; ${selection.reason})`,
-        );
+        updateRouterStatus(ctx, shortStatus(lastDecision));
         logDecision(ctx, cfg, lastDecision);
 
         const inner = aiStreamSimple(target, context, {
@@ -246,6 +246,22 @@ function findModelByRef(ctx: ExtensionContext, ref: string): Model<Api> | undefi
   const model = ctx.modelRegistry.find(provider, id);
   if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return undefined;
   return model;
+}
+
+function updateRouterStatus(ctx: ExtensionContext, text: string) {
+  if (ctx.model && !isRouterModel(ctx.model)) {
+    ctx.ui.setStatus("router", undefined);
+    return;
+  }
+  ctx.ui.setStatus("router", text);
+}
+
+function shortStatus(decision: LastDecision): string {
+  return `🧭 ${decision.chosen.split("/").at(-1) ?? decision.chosen} · ${decision.costTier}`;
+}
+
+function isRouterModel(model: Model<Api> | undefined): boolean {
+  return model?.provider === "pi-router" && model.id === "auto";
 }
 
 function parseForcedRoute(text: string): { route: ForcedRoute; text: string } | undefined {

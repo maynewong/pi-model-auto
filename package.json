@@ -1,0 +1,22 @@
+{
+  "name": "pi-model-router",
+  "version": "0.1.0",
+  "description": "Pi extension package that routes each turn to cheap or strong authenticated models.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "extension", "model-router"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

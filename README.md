@@ -19,12 +19,13 @@ Then select **Pi Router (Auto)** with `/model`.
 ## What it does
 
 - Builds a zero-config model pool from `ctx.modelRegistry.getAvailable()`.
-- Uses the cheapest authenticated model as `cheap` and the most expensive as `strong`.
+- Uses the cheapest authenticated model as `cheap` and the most expensive as `strong` by default.
+- Lets you pin `cheap` / `strong` explicitly for dogfooding custom model pools.
 - Falls back to transparent single-model routing if only one model is authenticated.
 - Applies hard constraints for:
   - image input,
   - context window,
-  - high/xhigh reasoning,
+  - optionally high/xhigh reasoning,
   - target model `maxTokens`.
 - Shows the selected target model persistently in the Pi status bar.
 - Delegates to `@earendil-works/pi-ai` so usage and cost are reported by the real target provider.
@@ -59,12 +60,27 @@ Optional config files:
       "reasoning": 0.15,
       "toolDensity": 0.10
     },
+    "models": {
+      "cheap": "gateway/deepseek-v4-flash",
+      "strong": "gateway/gpt-5.4"
+    },
+    "forceStrongOnHighReasoning": false,
     "log": false
   }
 }
 ```
 
+`models` is optional. Use it when catalog prices do not match your actual quality/cost preferences.
+
 When `log` is true, routing decisions are appended to `.pi/router.log`.
+
+## Debug
+
+Use the command below inside Pi to inspect the current pool and last routing decision:
+
+```text
+/router
+```
 
 ## Package layout
 

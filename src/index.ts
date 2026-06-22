@@ -17,59 +17,21 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import {
+  DEFAULT_CONFIG,
+  buildAutoPool,
+  decide,
+  modelKey,
+  resolveModel,
+  selectFromPool,
+  type Decision,
+  type Pool,
+  type ResolvedModel,
+  type RouterConfig,
+  type Tier,
+} from "./router-core.ts";
 
-type Tier = "cheap" | "strong";
-type RouteClass = Tier | "model";
 type ForcedRoute = { tier: Tier } | { model: string };
-
-interface RouterConfig {
-  threshold: number;
-  weights: {
-    contextTokens: number;
-    lastUserLen: number;
-    keyword: number;
-    reasoning: number;
-    toolDensity: number;
-  };
-  log: boolean;
-  /** Optional explicit tier pins, e.g. { cheap: "magi/deepseek-v4-flash", strong: "magi/gpt-5.4" }. */
-  tierModels: Partial<Record<Tier, string>>;
-  /** If true, high/xhigh Pi thinking level always upgrades to strong. */
-  forceStrongOnHighReasoning: boolean;
-}
-
-interface ResolvedModel {
-  tier: Tier;
-  model: Model<Api>;
-  acceptsImage: boolean;
-  price: number;
-}
-
-interface Pool {
-  byTier: Record<Tier, ResolvedModel | undefined>;
-  all: ResolvedModel[];
-}
-
-interface Decision {
-  cls: RouteClass;
-  score: number;
-  chosen: string;
-  reason?: string;
-}
-
-const DEFAULT_CONFIG: RouterConfig = {
-  threshold: 0.45,
-  weights: {
-    contextTokens: 0.25,
-    lastUserLen: 0.15,
-    keyword: 0.35,
-    reasoning: 0.15,
-    toolDensity: 0.1,
-  },
-  log: false,
-  tierModels: {},
-  forceStrongOnHighReasoning: false,
-};
 
 const ZERO_USAGE = {
   input: 0,
@@ -80,12 +42,21 @@ const ZERO_USAGE = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+interface LastDecision extends Decision {
+  chosen: string;
+  canonical: string | null;
+  costTier: string;
+  profile?: string;
+  confidence: string;
+  alternatives: string[];
+}
+
 export default function modelRouter(pi: ExtensionAPI) {
   let extCtx: ExtensionContext | undefined;
   let cfg: RouterConfig = DEFAULT_CONFIG;
-  let pool: Pool = { byTier: { cheap: undefined, strong: undefined }, all: [] };
+  let pool: Pool = { cheapPool: [], strongPool: [], standardPool: [], unknownPool: [], all: [] };
   let forcedRoute: ForcedRoute | undefined;
-  let lastDecision: Decision | undefined;
+  let lastDecision: LastDecision | undefined;
   let providerRegistered = false;
 
   pi.registerCommand("router", {
@@ -100,8 +71,6 @@ export default function modelRouter(pi: ExtensionAPI) {
     cfg = loadConfig(ctx);
     pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable()), cfg, ctx);
 
-    // Keep the API name unique so multiple Pi sessions cannot overwrite each
-    // other's streamSimple closure in the process-global api-registry.
     const api = `pi-router-api:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     if (providerRegistered) pi.unregisterProvider("pi-router");
     providerRegistered = true;
@@ -161,10 +130,9 @@ export default function modelRouter(pi: ExtensionAPI) {
         }
 
         const decision = decide(context, options, forcedRoute, cfg);
-        const selected = selectModel(decision, pool, context, options, ctx, cfg);
-        const target = selected.model;
+        const selection = selectModel(decision, pool, context, options, ctx, cfg);
+        const target = selection.selected.model;
 
-        // Resolve target auth. Do not forward router's dummy key to the target.
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(target);
         if (!auth.ok) throw new Error(auth.error);
 
@@ -175,12 +143,19 @@ export default function modelRouter(pi: ExtensionAPI) {
 
         lastDecision = {
           ...decision,
-          chosen: `${target.provider}/${target.id}`,
-          reason: selected.reason ?? decision.reason,
+          chosen: modelKey(target),
+          canonical: selection.selected.canonicalKey,
+          costTier: selection.selected.costTier,
+          profile: selection.profile,
+          confidence: selection.selected.confidence,
+          reason: selection.reason,
+          alternatives: selection.alternatives,
         };
 
-        const suffix = lastDecision.reason ? `; ${lastDecision.reason}` : "";
-        ctx.ui.setStatus("router", `🧭 router → ${target.id} (${selected.tier}${suffix})`);
+        ctx.ui.setStatus(
+          "router",
+          `🧭 router → ${target.id} (${selection.selected.canonicalKey ?? "unknown"}; ${selection.selected.costTier}; ${selection.profile}; ${selection.reason})`,
+        );
         logDecision(ctx, cfg, lastDecision);
 
         const inner = aiStreamSimple(target, context, {
@@ -209,38 +184,34 @@ export default function modelRouter(pi: ExtensionAPI) {
   }
 }
 
-function buildAutoPool(models: Model<Api>[]): Pool {
-  const candidates = models
-    .filter((model) => model.provider !== "pi-router")
-    .filter((model) => model.input?.includes("text"))
-    .map((model) => ({
-      model,
-      acceptsImage: model.input?.includes("image") ?? false,
-      price: effectivePrice(model),
-    }))
-    .sort((a, b) => a.price - b.price || modelKey(a.model).localeCompare(modelKey(b.model)));
+function selectModel(
+  decision: Decision,
+  pool: Pool,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  ctx: ExtensionContext,
+  cfg: RouterConfig,
+) {
+  if (decision.cls === "model") {
+    const model = findModelByRef(ctx, decision.chosen);
+    if (!model) throw new Error(`Pi Router: forced model not available or not authenticated: ${decision.chosen}`);
+    const selected = resolveModel(model);
+    return { selected, profile: selected.profiles[0] ?? "balanced", reason: "forced model", alternatives: [] };
+  }
 
-  if (candidates.length === 0) return { byTier: { cheap: undefined, strong: undefined }, all: [] };
-
-  const cheapBase = candidates[0];
-  const strongBase = candidates[candidates.length - 1];
-  const all = candidates.map((candidate) => ({
-    ...candidate,
-    tier: candidate === strongBase ? ("strong" as const) : ("cheap" as const),
-  }));
-
-  return {
-    byTier: {
-      cheap: { ...cheapBase, tier: "cheap" },
-      strong: { ...strongBase, tier: "strong" },
-    },
-    all,
-  };
+  const selection = selectFromPool(decision.cls, pool, context, options, cfg);
+  if (!selection) throw new Error("Pi Router: model pool is empty");
+  return selection;
 }
 
 function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionContext): Pool {
-  const byTier = { ...pool.byTier };
-  const all = [...pool.all];
+  const next: Pool = {
+    cheapPool: [...pool.cheapPool],
+    strongPool: [...pool.strongPool],
+    standardPool: [...pool.standardPool],
+    unknownPool: [...pool.unknownPool],
+    all: [...pool.all],
+  };
 
   for (const tier of ["cheap", "strong"] as const) {
     const ref = cfg.tierModels[tier];
@@ -252,20 +223,19 @@ function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionConte
       continue;
     }
 
-    const resolved: ResolvedModel = {
-      tier,
-      model,
-      acceptsImage: model.input.includes("image"),
-      price: effectivePrice(model),
-    };
-    byTier[tier] = resolved;
-
-    if (!all.some((item) => modelKey(item.model) === modelKey(model))) {
-      all.push(resolved);
-    }
+    const resolved = resolveModel(model);
+    prependUnique(tier === "cheap" ? next.cheapPool : next.strongPool, resolved);
+    prependUnique(next.all, resolved);
   }
 
-  return { byTier, all };
+  return next;
+}
+
+function prependUnique(items: ResolvedModel[], item: ResolvedModel) {
+  const key = modelKey(item.model);
+  const existing = items.findIndex((candidate) => modelKey(candidate.model) === key);
+  if (existing >= 0) items.splice(existing, 1);
+  items.unshift(item);
 }
 
 function findModelByRef(ctx: ExtensionContext, ref: string): Model<Api> | undefined {
@@ -278,200 +248,11 @@ function findModelByRef(ctx: ExtensionContext, ref: string): Model<Api> | undefi
   return model;
 }
 
-function describeRouter(pool: Pool, cfg: RouterConfig, lastDecision: Decision | undefined): string {
-  const cheap = pool.byTier.cheap ? modelKey(pool.byTier.cheap.model) : "none";
-  const strong = pool.byTier.strong ? modelKey(pool.byTier.strong.model) : "none";
-  const models = pool.all
-    .map((item) => {
-      const flags = [item.tier, item.acceptsImage ? "image" : "text", `price=${item.price}`].join(", ");
-      return `- ${modelKey(item.model)} (${flags})`;
-    })
-    .join("\n");
-
-  return [
-    "Pi Router",
-    `cheap: ${cheap}`,
-    `strong: ${strong}`,
-    `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
-    lastDecision ? `last: ${lastDecision.chosen} (${lastDecision.cls}, score=${lastDecision.score.toFixed(2)}${lastDecision.reason ? `, ${lastDecision.reason}` : ""})` : "last: none",
-    "pool:",
-    models || "- none",
-  ].join("\n");
-}
-
-function effectivePrice(model: Model<Api>): number {
-  const input = model.cost?.input ?? 0;
-  const output = model.cost?.output ?? 0;
-  const price = input + output * 3;
-  return price > 0 ? price : Number.MAX_SAFE_INTEGER / 2;
-}
-
-function decide(
-  context: Context,
-  options: SimpleStreamOptions | undefined,
-  forced: ForcedRoute | undefined,
-  cfg: RouterConfig,
-): Decision {
-  if (forced && "model" in forced) return { cls: "model", score: 1, chosen: forced.model, reason: "forced model" };
-  if (forced && "tier" in forced) {
-    return { cls: forced.tier, score: forced.tier === "strong" ? 1 : 0, chosen: "", reason: "forced" };
-  }
-
-  const score = classify(context, options, cfg);
-  return { cls: score >= cfg.threshold ? "strong" : "cheap", score, chosen: "" };
-}
-
-function classify(context: Context, options: SimpleStreamOptions | undefined, cfg: RouterConfig): number {
-  const text = lastUserText(context).toLowerCase();
-  const contextTokens = estimateContextTokens(context);
-  const reasoning = options?.reasoning && ["medium", "high", "xhigh"].includes(options.reasoning) ? 1 : 0;
-  const toolDensity = Math.min(1, countRecentToolResults(context) / 8);
-
-  const raw =
-    normalize(contextTokens, 8_000, 120_000) * cfg.weights.contextTokens +
-    normalize(text.length, 120, 1_200) * cfg.weights.lastUserLen +
-    keywordScore(text) * cfg.weights.keyword +
-    reasoning * cfg.weights.reasoning +
-    toolDensity * cfg.weights.toolDensity;
-
-  return Math.max(0, Math.min(1, raw));
-}
-
-function selectModel(
-  decision: Decision,
-  pool: Pool,
-  context: Context,
-  options: SimpleStreamOptions | undefined,
-  ctx: ExtensionContext,
-  cfg: RouterConfig,
-): ResolvedModel & { reason?: string } {
-  if (decision.cls === "model") {
-    const [provider, ...idParts] = decision.chosen.split("/");
-    const id = idParts.join("/");
-    const model = provider && id ? ctx.modelRegistry.find(provider, id) : undefined;
-
-    if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
-      throw new Error(`Pi Router: forced model not available or not authenticated: ${decision.chosen}`);
-    }
-
-    return enforceConstraints(
-      { tier: "strong", model, acceptsImage: model.input.includes("image"), price: effectivePrice(model) },
-      pool,
-      context,
-      options,
-      cfg,
-    );
-  }
-
-  const target = pool.byTier[decision.cls] ?? pool.byTier[decision.cls === "cheap" ? "strong" : "cheap"];
-  if (!target) throw new Error("Pi Router: model pool is empty");
-
-  return enforceConstraints(target, pool, context, options, cfg);
-}
-
-function enforceConstraints(
-  target: ResolvedModel,
-  pool: Pool,
-  context: Context,
-  options: SimpleStreamOptions | undefined,
-  cfg: RouterConfig,
-): ResolvedModel & { reason?: string } {
-  let reason: string | undefined;
-  let selected = target;
-  const needsImage = contextHasImage(context);
-  const contextTokens = estimateContextTokens(context);
-  const needsReasoning = options?.reasoning === "high" || options?.reasoning === "xhigh";
-
-  if (cfg.forceStrongOnHighReasoning && needsReasoning && selected.tier !== "strong" && pool.byTier.strong) {
-    selected = pool.byTier.strong;
-    reason = "reasoning→strong";
-  }
-
-  if (needsImage && !selected.acceptsImage) {
-    const imageModel = preferStrongEnough(pool.all.filter((item) => item.acceptsImage), selected);
-    if (!imageModel) throw new Error("Pi Router: no authenticated image-capable model is available");
-    selected = imageModel;
-    reason = "image input";
-  }
-
-  if (selected.model.contextWindow && contextTokens > selected.model.contextWindow * 0.8) {
-    const larger = preferStrongEnough(pool.all.filter((item) => contextTokens <= item.model.contextWindow * 0.8), selected);
-    if (!larger) throw new Error("Pi Router: no authenticated model has enough context window for this request");
-    selected = larger;
-    reason = "context window";
-  }
-
-  return { ...selected, reason };
-}
-
-function preferStrongEnough(candidates: ResolvedModel[], current: ResolvedModel): ResolvedModel | undefined {
-  return candidates.sort(
-    (a, b) => tierRank(b.tier) - tierRank(a.tier) || Math.abs(a.price - current.price) - Math.abs(b.price - current.price),
-  )[0];
-}
-
-function tierRank(tier: Tier): number {
-  return tier === "strong" ? 1 : 0;
-}
-
 function parseForcedRoute(text: string): { route: ForcedRoute; text: string } | undefined {
   const match = text.match(/^@(cheap|strong|model:([^\s]+))\s+([\s\S]*)$/);
   if (!match) return undefined;
   if (match[1] === "cheap" || match[1] === "strong") return { route: { tier: match[1] }, text: match[3] };
   return { route: { model: match[2] }, text: match[3] };
-}
-
-function contextHasImage(context: Context): boolean {
-  return context.messages.some(
-    (message) => Array.isArray(message.content) && message.content.some((part) => part.type === "image"),
-  );
-}
-
-function lastUserText(context: Context): string {
-  for (let i = context.messages.length - 1; i >= 0; i--) {
-    const message = context.messages[i];
-    if (message.role !== "user") continue;
-    if (typeof message.content === "string") return message.content;
-    return message.content
-      .filter((part) => part.type === "text")
-      .map((part) => part.text)
-      .join("\n");
-  }
-  return "";
-}
-
-function estimateContextTokens(context: Context): number {
-  const system = context.systemPrompt?.length ?? 0;
-  const chars = context.messages.reduce((sum, message) => {
-    if (typeof message.content === "string") return sum + message.content.length;
-
-    return sum + message.content.reduce((inner, part) => {
-      if (part.type === "text") return inner + part.text.length;
-      if (part.type === "thinking") return inner + part.thinking.length;
-      if (part.type === "toolCall") return inner + JSON.stringify(part.arguments).length + part.name.length;
-      return inner + 1024;
-    }, 0);
-  }, system);
-
-  return Math.ceil(chars / 4);
-}
-
-function countRecentToolResults(context: Context): number {
-  return context.messages.slice(-12).filter((message) => message.role === "toolResult").length;
-}
-
-function keywordScore(text: string): number {
-  const cheap = /\b(format|lint|typo|rename|docs?|readme|translate|summari[sz]e|grep|search)\b|格式化|排版|错别字|文档|翻译|总结|搜索|查找|简单/.test(text);
-  const strong = /\b(architecture|design|debug|root cause|race condition|refactor|multi-file|security|performance|concurrency|plan)\b|架构|设计|根因|并发|性能|安全|重构|复杂|方案|计划/.test(text);
-  if (strong) return 1;
-  if (cheap) return 0;
-  return 0.45;
-}
-
-function normalize(value: number, low: number, high: number): number {
-  if (value <= low) return 0;
-  if (value >= high) return 1;
-  return (value - low) / (high - low);
 }
 
 function loadConfig(ctx: ExtensionContext): RouterConfig {
@@ -501,7 +282,35 @@ function configPaths(ctx: ExtensionContext): string[] {
   return paths;
 }
 
-function logDecision(ctx: ExtensionContext, cfg: RouterConfig, decision: Decision | undefined) {
+function describeRouter(pool: Pool, cfg: RouterConfig, lastDecision: LastDecision | undefined): string {
+  const lines = [
+    "Pi Router",
+    `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
+    `cheapPool: ${pool.cheapPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
+    `strongPool: ${pool.strongPool.map((item) => `${modelKey(item.model)}(${item.canonicalKey ?? "unknown"}/${item.costTier}/${item.profiles.join("+")})`).join(", ") || "none"}`,
+    `standardPool: ${pool.standardPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
+    `unknownPool: ${pool.unknownPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
+  ];
+
+  if (lastDecision) {
+    lines.push(
+      "last:",
+      `  chosen: ${lastDecision.chosen}`,
+      `  canonical: ${lastDecision.canonical ?? "unknown"}`,
+      `  costTier: ${lastDecision.costTier}`,
+      `  profile: ${lastDecision.profile ?? "unknown"}`,
+      `  confidence: ${lastDecision.confidence}`,
+      `  reason: ${lastDecision.reason ?? "none"}`,
+      `  alternatives: ${lastDecision.alternatives.join(", ") || "none"}`,
+    );
+  } else {
+    lines.push("last: none");
+  }
+
+  return lines.join("\n");
+}
+
+function logDecision(ctx: ExtensionContext, cfg: RouterConfig, decision: LastDecision | undefined) {
   if (!cfg.log || !decision) return;
   appendJsonLine(ctx, { ts: new Date().toISOString(), ...decision });
 }
@@ -509,11 +318,12 @@ function logDecision(ctx: ExtensionContext, cfg: RouterConfig, decision: Decisio
 function logTerminalEvent(
   ctx: ExtensionContext,
   cfg: RouterConfig,
-  decision: Decision | undefined,
+  decision: LastDecision | undefined,
   event: AssistantMessageEvent,
 ) {
   if (!cfg.log || !decision) return;
   if (event.type !== "done" && event.type !== "error") return;
+
   const message = event.type === "done" ? event.message : event.error;
   appendJsonLine(ctx, {
     ts: new Date().toISOString(),
@@ -544,8 +354,4 @@ function makeRouterError(model: Model<Api>, error: unknown): AssistantMessageEve
   };
 
   return { type: "error", reason: "error", error: message };
-}
-
-function modelKey(model: Model<Api>): string {
-  return `${model.provider}/${model.id}`;
 }

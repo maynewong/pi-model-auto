@@ -49,6 +49,34 @@ describe("canonical model routing", () => {
     ]);
   });
 
+  it("filters models by provider/id/name/canonical substring", () => {
+    const pool = buildAutoPool(
+      [
+        model("deepseek", "deepseek-v4-flash"),
+        model("gateway", "deepseek-v4-flash"),
+        model("gateway-codex", "gpt-5.5"),
+        model("openai-codex", "gpt-5.5"),
+      ],
+      { ...DEFAULT_CONFIG, modelFilter: { include: ["gateway"], exclude: [] } },
+    );
+
+    expect(pool.all.map((item) => `${item.model.provider}/${item.model.id}`)).toEqual([
+      "gateway/deepseek-v4-flash",
+      "gateway-codex/gpt-5.5",
+    ]);
+    expect(pool.cheapPool.map((item) => item.model.provider)).toEqual(["gateway"]);
+    expect(pool.strongPool.map((item) => item.model.provider)).toEqual(["gateway-codex"]);
+  });
+
+  it("applies exclude after include", () => {
+    const pool = buildAutoPool(
+      [model("gateway-codex", "gpt-5.5"), model("gateway", "glm-5.2")],
+      { ...DEFAULT_CONFIG, modelFilter: { include: ["gateway"], exclude: ["codex"] } },
+    );
+
+    expect(pool.all.map((item) => `${item.model.provider}/${item.model.id}`)).toEqual(["gateway/glm-5.2"]);
+  });
+
   it("keeps unknown models out of cheap/strong inferred pools", () => {
     const pool = buildAutoPool([model("local", "Qwen3.6-35B-A3B-UD-MLX-4bit")]);
     expect(pool.cheapPool).toHaveLength(0);

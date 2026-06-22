@@ -21,6 +21,7 @@ import {
   DEFAULT_CONFIG,
   buildAutoPool,
   decide,
+  matchesModelFilter,
   modelKey,
   resolveModel,
   selectFromPool,
@@ -224,6 +225,11 @@ function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionConte
     }
 
     const resolved = resolveModel(model, cfg);
+    if (!matchesModelFilter(resolved, cfg.modelFilter)) {
+      ctx.ui.notify(`Pi Router: configured ${tier} model rejected by modelFilter: ${ref}`, "warning");
+      continue;
+    }
+
     prependUnique(tier === "cheap" ? next.cheapPool : next.strongPool, resolved);
     prependUnique(next.all, resolved);
   }
@@ -284,6 +290,7 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         ...router,
         weights: { ...cfg.weights, ...(router.weights ?? {}) },
         tierModels: { ...cfg.tierModels, ...(router.tierModels ?? router.models ?? {}) },
+        modelFilter: { ...cfg.modelFilter, ...(router.modelFilter ?? {}) },
         modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
       };
     } catch (error) {
@@ -303,6 +310,7 @@ function describeRouter(pool: Pool, cfg: RouterConfig, lastDecision: LastDecisio
   const lines = [
     "Pi Router",
     `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
+    `modelFilter: include=[${cfg.modelFilter.include.join(", ") || "*"}] exclude=[${cfg.modelFilter.exclude.join(", ") || "none"}]`,
     `cheapPool: ${pool.cheapPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
     `strongPool: ${pool.strongPool.map((item) => `${modelKey(item.model)}(${item.canonicalKey ?? "unknown"}/${item.costTier}/${item.profiles.join("+")})`).join(", ") || "none"}`,
     `standardPool: ${pool.standardPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,

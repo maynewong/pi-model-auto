@@ -68,6 +68,14 @@ No config is required for covered canonical models.
       "cheap": "gateway/deepseek-v4-flash",
       "strong": "gateway/gpt-5.4"
     },
+    "modelOverrides": {
+      "local/Qwen3.6-35B-A3B-UD-MLX-4bit": {
+        "canonical": "qwen3.6-35b-a3b-ud-mlx-4bit",
+        "costTier": "cheap",
+        "profiles": ["fast", "coder"],
+        "frontier": false
+      }
+    },
     "forceStrongOnHighReasoning": false,
     "log": false
   }
@@ -75,6 +83,13 @@ No config is required for covered canonical models.
 ```
 
 `models` is optional. Use it when catalog prices do not match your actual quality/cost preferences.
+
+`modelOverrides` is optional. Use it to classify unknown/private/local models. Keys may be `provider/model-id`, model id, or normalized model id. Supported fields:
+
+- `canonical`: display key used by `/router`
+- `costTier`: `cheap`, `standard`, `premium`, or `unknown`
+- `profiles`: any of `deep`, `fast`, `coder`, `balanced`, `vision`, `frontier`
+- `frontier`: whether the model should enter the strong pool as a frontier candidate
 
 When `log` is true, routing decisions are appended to `.pi/router.log`.
 

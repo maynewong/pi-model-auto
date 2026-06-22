@@ -33,6 +33,13 @@ export interface Pool {
   all: ResolvedModel[];
 }
 
+export interface ModelOverride {
+  canonical?: string;
+  costTier: CostTier;
+  profiles?: ModelProfile[];
+  frontier?: boolean;
+}
+
 export interface RouterConfig {
   threshold: number;
   weights: {
@@ -44,6 +51,8 @@ export interface RouterConfig {
   };
   log: boolean;
   tierModels: Partial<Record<Tier, string>>;
+  /** User-supplied metadata for unknown/private/local models. Keys may be provider/id, model id, or normalized model id. */
+  modelOverrides: Record<string, ModelOverride>;
   forceStrongOnHighReasoning: boolean;
 }
 
@@ -73,6 +82,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
   },
   log: false,
   tierModels: {},
+  modelOverrides: {},
   forceStrongOnHighReasoning: false,
 };
 
@@ -112,11 +122,11 @@ export function modelKey(model: Model<Api>): string {
   return `${model.provider}/${model.id}`;
 }
 
-export function buildAutoPool(models: Model<Api>[]): Pool {
+export function buildAutoPool(models: Model<Api>[], cfg: RouterConfig = DEFAULT_CONFIG): Pool {
   const all = models
     .filter((model) => model.provider !== "pi-router")
     .filter((model) => model.input?.includes("text"))
-    .map(resolveModel)
+    .map((model) => resolveModel(model, cfg))
     .sort(compareResolvedModels);
 
   return {
@@ -128,8 +138,26 @@ export function buildAutoPool(models: Model<Api>[]): Pool {
   };
 }
 
-export function resolveModel(model: Model<Api>): ResolvedModel {
-  const resolution = resolveCanonicalModel(modelKey(model));
+export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONFIG): ResolvedModel {
+  const key = modelKey(model);
+  const resolution = resolveCanonicalModel(key);
+  const override = findModelOverride(cfg, key, resolution.canonical?.key ?? null);
+
+  if (override) {
+    return {
+      model,
+      acceptsImage: model.input?.includes("image") ?? false,
+      canonicalKey: override.canonical ?? resolution.canonical?.key ?? normalizeModelKey(key),
+      costTier: override.costTier,
+      profiles: override.profiles ?? resolution.profiles,
+      frontier: override.frontier ?? resolution.frontier,
+      confidence: resolution.canonical ? "medium" : "high",
+      matchReason: resolution.canonical
+        ? `user override + ${resolution.reason}`
+        : "user override for unknown model",
+    };
+  }
+
   return {
     model,
     acceptsImage: model.input?.includes("image") ?? false,
@@ -140,6 +168,19 @@ export function resolveModel(model: Model<Api>): ResolvedModel {
     confidence: resolution.confidence,
     matchReason: resolution.reason,
   };
+}
+
+export function findModelOverride(
+  cfg: RouterConfig,
+  key: string,
+  canonicalKey: string | null,
+): ModelOverride | undefined {
+  const candidates = [key, key.toLowerCase(), normalizeModelKey(key), canonicalKey].filter(Boolean) as string[];
+  for (const candidate of candidates) {
+    const override = cfg.modelOverrides[candidate];
+    if (override) return override;
+  }
+  return undefined;
 }
 
 export function decide(

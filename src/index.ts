@@ -32,6 +32,10 @@ interface RouterConfig {
     toolDensity: number;
   };
   log: boolean;
+  /** Optional explicit tier pins, e.g. { cheap: "magi/deepseek-v4-flash", strong: "magi/gpt-5.4" }. */
+  tierModels: Partial<Record<Tier, string>>;
+  /** If true, high/xhigh Pi thinking level always upgrades to strong. */
+  forceStrongOnHighReasoning: boolean;
 }
 
 interface ResolvedModel {
@@ -63,6 +67,8 @@ const DEFAULT_CONFIG: RouterConfig = {
     toolDensity: 0.1,
   },
   log: false,
+  tierModels: {},
+  forceStrongOnHighReasoning: false,
 };
 
 const ZERO_USAGE = {
@@ -82,10 +88,17 @@ export default function modelRouter(pi: ExtensionAPI) {
   let lastDecision: Decision | undefined;
   let providerRegistered = false;
 
+  pi.registerCommand("router", {
+    description: "Show Pi Model Router pool and last decision",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(describeRouter(pool, cfg, lastDecision), "info");
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     extCtx = ctx;
     cfg = loadConfig(ctx);
-    pool = buildAutoPool(ctx.modelRegistry.getAvailable());
+    pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable()), cfg, ctx);
 
     // Keep the API name unique so multiple Pi sessions cannot overwrite each
     // other's streamSimple closure in the process-global api-registry.
@@ -148,7 +161,7 @@ export default function modelRouter(pi: ExtensionAPI) {
         }
 
         const decision = decide(context, options, forcedRoute, cfg);
-        const selected = selectModel(decision, pool, context, options, ctx);
+        const selected = selectModel(decision, pool, context, options, ctx, cfg);
         const target = selected.model;
 
         // Resolve target auth. Do not forward router's dummy key to the target.
@@ -225,6 +238,67 @@ function buildAutoPool(models: Model<Api>[]): Pool {
   };
 }
 
+function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionContext): Pool {
+  const byTier = { ...pool.byTier };
+  const all = [...pool.all];
+
+  for (const tier of ["cheap", "strong"] as const) {
+    const ref = cfg.tierModels[tier];
+    if (!ref) continue;
+
+    const model = findModelByRef(ctx, ref);
+    if (!model) {
+      ctx.ui.notify(`Pi Router: configured ${tier} model not found or unauthenticated: ${ref}`, "warning");
+      continue;
+    }
+
+    const resolved: ResolvedModel = {
+      tier,
+      model,
+      acceptsImage: model.input.includes("image"),
+      price: effectivePrice(model),
+    };
+    byTier[tier] = resolved;
+
+    if (!all.some((item) => modelKey(item.model) === modelKey(model))) {
+      all.push(resolved);
+    }
+  }
+
+  return { byTier, all };
+}
+
+function findModelByRef(ctx: ExtensionContext, ref: string): Model<Api> | undefined {
+  const [provider, ...idParts] = ref.split("/");
+  const id = idParts.join("/");
+  if (!provider || !id) return undefined;
+
+  const model = ctx.modelRegistry.find(provider, id);
+  if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return undefined;
+  return model;
+}
+
+function describeRouter(pool: Pool, cfg: RouterConfig, lastDecision: Decision | undefined): string {
+  const cheap = pool.byTier.cheap ? modelKey(pool.byTier.cheap.model) : "none";
+  const strong = pool.byTier.strong ? modelKey(pool.byTier.strong.model) : "none";
+  const models = pool.all
+    .map((item) => {
+      const flags = [item.tier, item.acceptsImage ? "image" : "text", `price=${item.price}`].join(", ");
+      return `- ${modelKey(item.model)} (${flags})`;
+    })
+    .join("\n");
+
+  return [
+    "Pi Router",
+    `cheap: ${cheap}`,
+    `strong: ${strong}`,
+    `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
+    lastDecision ? `last: ${lastDecision.chosen} (${lastDecision.cls}, score=${lastDecision.score.toFixed(2)}${lastDecision.reason ? `, ${lastDecision.reason}` : ""})` : "last: none",
+    "pool:",
+    models || "- none",
+  ].join("\n");
+}
+
 function effectivePrice(model: Model<Api>): number {
   const input = model.cost?.input ?? 0;
   const output = model.cost?.output ?? 0;
@@ -269,6 +343,7 @@ function selectModel(
   context: Context,
   options: SimpleStreamOptions | undefined,
   ctx: ExtensionContext,
+  cfg: RouterConfig,
 ): ResolvedModel & { reason?: string } {
   if (decision.cls === "model") {
     const [provider, ...idParts] = decision.chosen.split("/");
@@ -284,13 +359,14 @@ function selectModel(
       pool,
       context,
       options,
+      cfg,
     );
   }
 
   const target = pool.byTier[decision.cls] ?? pool.byTier[decision.cls === "cheap" ? "strong" : "cheap"];
   if (!target) throw new Error("Pi Router: model pool is empty");
 
-  return enforceConstraints(target, pool, context, options);
+  return enforceConstraints(target, pool, context, options, cfg);
 }
 
 function enforceConstraints(
@@ -298,6 +374,7 @@ function enforceConstraints(
   pool: Pool,
   context: Context,
   options: SimpleStreamOptions | undefined,
+  cfg: RouterConfig,
 ): ResolvedModel & { reason?: string } {
   let reason: string | undefined;
   let selected = target;
@@ -305,7 +382,7 @@ function enforceConstraints(
   const contextTokens = estimateContextTokens(context);
   const needsReasoning = options?.reasoning === "high" || options?.reasoning === "xhigh";
 
-  if (needsReasoning && selected.tier !== "strong" && pool.byTier.strong) {
+  if (cfg.forceStrongOnHighReasoning && needsReasoning && selected.tier !== "strong" && pool.byTier.strong) {
     selected = pool.byTier.strong;
     reason = "reasoning→strong";
   }
@@ -409,6 +486,7 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         ...cfg,
         ...router,
         weights: { ...cfg.weights, ...(router.weights ?? {}) },
+        tierModels: { ...cfg.tierModels, ...(router.tierModels ?? router.models ?? {}) },
       };
     } catch (error) {
       ctx.ui.notify(`Pi Router: failed to read ${file}: ${error instanceof Error ? error.message : String(error)}`, "warning");

@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
-import { DEFAULT_CONFIG, buildAutoPool, normalizeModelKey, resolveCanonicalModel, selectFromPool } from "./router-core.ts";
+import {
+  DEFAULT_CONFIG,
+  buildAutoPool,
+  normalizeModelKey,
+  resolveCanonicalModel,
+  routingTurnKey,
+  selectFromPool,
+  shouldReuseTurnSelection,
+} from "./router-core.ts";
 
 function model(provider: string, id: string): Model<Api> {
   return {
@@ -19,6 +27,32 @@ function model(provider: string, id: string): Model<Api> {
 
 function context(text: string): Context {
   return { messages: [{ role: "user", content: text, timestamp: Date.now() }] };
+}
+
+function toolContinuationContext(text: string): Context {
+  return {
+    messages: [
+      { role: "user", content: text, timestamp: 1 },
+      {
+        role: "assistant",
+        api: "openai-completions",
+        provider: "gateway",
+        model: "deepseek-v4-flash",
+        content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "git status" } }],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "toolUse",
+        timestamp: 2,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "bash",
+        content: [{ type: "text", text: " M file.ex" }],
+        isError: false,
+        timestamp: 3,
+      },
+    ],
+  };
 }
 
 describe("canonical model routing", () => {
@@ -114,5 +148,23 @@ describe("canonical model routing", () => {
     expect(selectFromPool("strong", pool, context("debug root cause and plan architecture"), undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("glm-5.2");
     expect(selectFromPool("strong", pool, context("need a fast coding response"), undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("kimi-k2.7-code-highspeed");
     expect(selectFromPool("strong", pool, context("general coding task"), undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("gpt-5.5");
+  });
+
+  it("keeps one routing key for tool continuations within the same user turn", () => {
+    const firstRequest = context("创建 mr");
+    const continuation = toolContinuationContext("创建 mr");
+    const nextUser = {
+      messages: [
+        ...continuation.messages,
+        { role: "assistant", content: [{ type: "text", text: "done" }], api: "openai-completions", provider: "gateway", model: "deepseek-v4-flash", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 4 },
+        { role: "user", content: "reply ok", timestamp: 5 },
+      ],
+    } satisfies Context;
+
+    expect(routingTurnKey(continuation)).toBe(routingTurnKey(firstRequest));
+    expect(shouldReuseTurnSelection(firstRequest)).toBe(false);
+    expect(shouldReuseTurnSelection(continuation)).toBe(true);
+    expect(routingTurnKey(nextUser)).not.toBe(routingTurnKey(firstRequest));
+    expect(shouldReuseTurnSelection(nextUser)).toBe(false);
   });
 });

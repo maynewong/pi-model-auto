@@ -56,6 +56,16 @@ function toolContinuationContext(text: string): Context {
 }
 
 describe("canonical model routing", () => {
+  it("enables quota-aware routing by default without in-turn retry", () => {
+    expect(DEFAULT_CONFIG.quota).toMatchObject({
+      enabled: true,
+      reserveRatio: 0.05,
+      inTurnRetry: false,
+      maxRetries: 2,
+      defaultCooldownMs: 300_000,
+    });
+  });
+
   it("normalizes conservatively", () => {
     expect(normalizeModelKey("magi/Kimi-K2.7-Code-Highspeed(high)")).toBe("kimi-k2.7-code-highspeed");
     expect(normalizeModelKey("vibeproxy/gpt-5.5(medium)")).toBe("gpt-5.5");

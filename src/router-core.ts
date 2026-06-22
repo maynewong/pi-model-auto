@@ -1,5 +1,6 @@
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { CANONICAL_MODELS, type CanonicalMeta, type CostTier, type ModelProfile } from "./canonical-models.ts";
+import { DEFAULT_QUOTA_CONFIG, type QuotaConfig } from "./quota.ts";
 
 export type Tier = "cheap" | "strong";
 export type RouteClass = Tier | "model";
@@ -61,6 +62,7 @@ export interface RouterConfig {
   /** User-supplied metadata for unknown/private/local models. Keys may be provider/id, model id, or normalized model id. */
   modelOverrides: Record<string, ModelOverride>;
   forceStrongOnHighReasoning: boolean;
+  quota: QuotaConfig;
 }
 
 export interface Decision {
@@ -92,6 +94,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
   modelFilter: { include: [], exclude: [] },
   modelOverrides: {},
   forceStrongOnHighReasoning: false,
+  quota: DEFAULT_QUOTA_CONFIG,
 };
 
 export function normalizeModelKey(key: string): string {

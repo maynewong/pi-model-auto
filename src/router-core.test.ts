@@ -57,6 +57,25 @@ describe("canonical model routing", () => {
     expect(pool.unknownPool[0].confidence).toBe("low");
   });
 
+  it("allows users to classify unknown models with modelOverrides", () => {
+    const pool = buildAutoPool([model("local", "Qwen3.6-35B-A3B-UD-MLX-4bit")], {
+      ...DEFAULT_CONFIG,
+      modelOverrides: {
+        "local/Qwen3.6-35B-A3B-UD-MLX-4bit": {
+          canonical: "qwen3.6-35b-a3b-ud-mlx-4bit",
+          costTier: "cheap",
+          profiles: ["fast", "coder"],
+          frontier: false,
+        },
+      },
+    });
+
+    expect(pool.unknownPool).toHaveLength(0);
+    expect(pool.cheapPool[0].canonicalKey).toBe("qwen3.6-35b-a3b-ud-mlx-4bit");
+    expect(pool.cheapPool[0].profiles).toEqual(["fast", "coder"]);
+    expect(pool.cheapPool[0].matchReason).toBe("user override for unknown model");
+  });
+
   it("selects deep and fast profiles from the strong pool", () => {
     const pool = buildAutoPool([
       model("magi-codex", "gpt-5.5"),

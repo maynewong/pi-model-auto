@@ -69,7 +69,7 @@ export default function modelRouter(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     extCtx = ctx;
     cfg = loadConfig(ctx);
-    pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable()), cfg, ctx);
+    pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable(), cfg), cfg, ctx);
 
     const api = `pi-router-api:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     if (providerRegistered) pi.unregisterProvider("pi-router");
@@ -195,7 +195,7 @@ function selectModel(
   if (decision.cls === "model") {
     const model = findModelByRef(ctx, decision.chosen);
     if (!model) throw new Error(`Pi Router: forced model not available or not authenticated: ${decision.chosen}`);
-    const selected = resolveModel(model);
+    const selected = resolveModel(model, cfg);
     return { selected, profile: selected.profiles[0] ?? "balanced", reason: "forced model", alternatives: [] };
   }
 
@@ -223,7 +223,7 @@ function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionConte
       continue;
     }
 
-    const resolved = resolveModel(model);
+    const resolved = resolveModel(model, cfg);
     prependUnique(tier === "cheap" ? next.cheapPool : next.strongPool, resolved);
     prependUnique(next.all, resolved);
   }
@@ -268,6 +268,7 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         ...router,
         weights: { ...cfg.weights, ...(router.weights ?? {}) },
         tierModels: { ...cfg.tierModels, ...(router.tierModels ?? router.models ?? {}) },
+        modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
       };
     } catch (error) {
       ctx.ui.notify(`Pi Router: failed to read ${file}: ${error instanceof Error ? error.message : String(error)}`, "warning");

@@ -19,8 +19,10 @@ import {
 } from "@earendil-works/pi-ai";
 import {
   DEFAULT_CONFIG,
+  axisValue,
   buildAutoPool,
   decide,
+  frontierChain,
   matchesModelFilter,
   modelKey,
   resolveModel,
@@ -244,7 +246,7 @@ function selectModel(
     return { selected, profile: selected.profiles[0] ?? "balanced", reason: "forced model", alternatives: [] };
   }
 
-  const selection = selectFromPool(decision.cls, pool, context, options, cfg);
+  const selection = selectFromPool(decision, pool, context, options, cfg);
   if (!selection) throw new Error("Pi Router: model pool is empty");
   return selection;
 }
@@ -332,6 +334,7 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         tierModels: { ...cfg.tierModels, ...(router.tierModels ?? router.models ?? {}) },
         modelFilter: { ...cfg.modelFilter, ...(router.modelFilter ?? {}) },
         modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
+        willingness: { ...cfg.willingness, ...(router.willingness ?? {}) },
         quota: { ...cfg.quota, ...(router.quota ?? {}) },
       };
     } catch (error) {
@@ -366,6 +369,14 @@ function describeRouter(
     `strongPool: ${pool.strongPool.map((item) => `${modelKey(item.model)}(${item.canonicalKey ?? "unknown"}/${item.costTier}/${item.profiles.join("+")})`).join(", ") || "none"}`,
     `standardPool: ${pool.standardPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
     `unknownPool: ${pool.unknownPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
+    "frontier (auto climbs these cheap→strong by hardness):",
+    ...(["coder", "deep", "balanced"] as const).map((profile) => {
+      const chain = frontierChain(pool.all, profile);
+      const points = chain
+        .map((item) => `${item.canonicalKey ?? modelKey(item.model)}(${axisValue(item, profile).toFixed(0)}@$${item.priceBlended})`)
+        .join(" → ");
+      return `  ${profile}: ${points || "none"}`;
+    }),
   ];
 
   if (lastDecision) {

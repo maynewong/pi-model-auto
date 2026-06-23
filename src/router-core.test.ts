@@ -3,12 +3,17 @@ import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import {
   DEFAULT_CONFIG,
   buildAutoPool,
+  decide,
   normalizeModelKey,
   resolveCanonicalModel,
   routingTurnKey,
   selectFromPool,
   shouldReuseTurnSelection,
 } from "./router-core.ts";
+
+function strongDecision(ctx: Context) {
+  return decide(ctx, undefined, { tier: "strong" }, DEFAULT_CONFIG);
+}
 
 function model(provider: string, id: string): Model<Api> {
   return {
@@ -148,16 +153,43 @@ describe("canonical model routing", () => {
     expect(pool.cheapPool[0].matchReason).toBe("user override for unknown model");
   });
 
-  it("selects deep and fast profiles from the strong pool", () => {
+  it("forced @strong climbs to the top of the capability frontier", () => {
     const pool = buildAutoPool([
       model("magi-codex", "gpt-5.5"),
       model("magi", "glm-5.2"),
       model("magi", "kimi-k2.7-code-highspeed"),
     ]);
 
-    expect(selectFromPool("strong", pool, context("debug root cause and plan architecture"), undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("glm-5.2");
-    expect(selectFromPool("strong", pool, context("need a fast coding response"), undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("kimi-k2.7-code-highspeed");
-    expect(selectFromPool("strong", pool, context("general coding task"), undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("gpt-5.5");
+    // @strong = unlimited willingness → top of frontier on each axis.
+    const deep = context("debug root cause and plan architecture");
+    expect(selectFromPool(strongDecision(deep), pool, deep, undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("gpt-5.5");
+    const coder = context("general coding task");
+    expect(selectFromPool(strongDecision(coder), pool, coder, undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("gpt-5.5");
+    // fast: highest throughput regardless of tier.
+    const fast = context("need a fast coding response");
+    expect(selectFromPool(strongDecision(fast), pool, fast, undefined, DEFAULT_CONFIG)?.selected.canonicalKey).toBe("kimi-k2.7-code-highspeed");
+  });
+
+  it("climbs the frontier by hardness so the whole spread is reachable in auto mode", () => {
+    const pool = buildAutoPool([
+      model("magi", "deepseek-v4-flash"),
+      model("magi", "deepseek-v4-pro"),
+      model("magi", "kimi-k2.7-code"),
+      model("magi", "glm-5.2"),
+      model("magi-codex", "gpt-5.4"),
+      model("magi-codex", "gpt-5.5"),
+    ]);
+    const coder = context("implement a typescript helper");
+
+    const pick = (opts: { reasoning: "medium" | "high" | "xhigh" } | undefined) =>
+      selectFromPool(decide(coder, opts, undefined, DEFAULT_CONFIG), pool, coder, opts, DEFAULT_CONFIG)?.selected.canonicalKey;
+
+    // off → cheap end; medium → mid value point (pro→kimi step too steep to climb past);
+    // high → glm; xhigh → top of frontier. The previously-idle "standard" model is now reachable.
+    expect(pick(undefined)).toBe("deepseek-v4-flash");
+    expect(pick({ reasoning: "medium" })).toBe("deepseek-v4-pro");
+    expect(pick({ reasoning: "high" })).toBe("glm-5.2");
+    expect(pick({ reasoning: "xhigh" })).toBe("gpt-5.5");
   });
 
   it("keeps one routing key for tool continuations within the same user turn", () => {

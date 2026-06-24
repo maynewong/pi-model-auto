@@ -3,3 +3,6 @@ dist/
 .pi/
 .worktrees/
 *.log
+
+# local design notes, not published
+docs/routing-redesign.md

@@ -88,3 +88,54 @@ export const CANONICAL_MODELS: CanonicalMeta[] = [
   // NVIDIA
   { key: "nemotron-3-ultra", intelligence: 37.8, priceBlended: 1.175, scores: { coding: 49.3, agentic: 0.539, ifbench: 0.814 }, tps: 148, costTier: "standard", profiles: ["balanced"], frontier: false, source: AA },
 ];
+
+/**
+ * Per-model results from the Ramp SWE-Bench run (mini-swe-agent harness, 80 tasks): real agentic
+ * resolve-rate and measured per-task cost (API list pricing, prompt-cache included). This is a
+ * SEPARATE source from the Artificial Analysis numbers above — the router consumes one or the other
+ * (`capabilitySource`), never a merge: mixing real outcomes and synthetic scores on one scale is
+ * meaningless. Keyed by canonical model key. A model absent here has no Ramp result and is therefore
+ * not auto-routed when `capabilitySource` is `ramp` (reach it via `modelOverrides` or a forced route).
+ *
+ * Caveat: a single harness/run, reasoning fixed at high/xhigh, billed at API list (no subscription),
+ * no vision and no throughput metric. It is a real-task coding slice, not a universal capability score.
+ */
+export interface RampMeta {
+  /** Canonical model key; matches a `CanonicalMeta.key` above. */
+  key: string;
+  /** SWE-bench resolve rate, 0–100. The capability axis for every profile under the `ramp` source. */
+  resolveRate: number;
+  /** Mean measured cost per task, USD (API list pricing). The Pareto cost axis under `ramp`. */
+  costPerTask: number;
+  /** Mean tool-call turns to complete. Informational (shown in `/router`). */
+  turns: number;
+  source: string;
+}
+
+const RAMP = "Ramp SWE-Bench (mini-swe-agent), 2026-06";
+
+export const RAMP_MODELS: RampMeta[] = [
+  { key: "claude-fable-5", resolveRate: 87.5, costPerTask: 2.66, turns: 48, source: RAMP },
+  { key: "claude-opus-4-7", resolveRate: 83.8, costPerTask: 2.24, turns: 71, source: RAMP },
+  { key: "gpt-5.5", resolveRate: 83.8, costPerTask: 1.81, turns: 52, source: RAMP },
+  { key: "glm-5.2", resolveRate: 80.0, costPerTask: 1.88, turns: 98, source: RAMP },
+  { key: "kimi-k2.7-code", resolveRate: 78.8, costPerTask: 0.89, turns: 77, source: RAMP },
+  { key: "claude-opus-4-8", resolveRate: 77.5, costPerTask: 1.09, turns: 39, source: RAMP },
+  { key: "gemini-3.1-pro", resolveRate: 73.8, costPerTask: 1.03, turns: 55, source: RAMP },
+  { key: "claude-sonnet-4-6", resolveRate: 72.5, costPerTask: 0.79, turns: 49, source: RAMP },
+  { key: "gpt-5.4", resolveRate: 72.5, costPerTask: 0.66, turns: 28, source: RAMP },
+  { key: "kimi-k2.6", resolveRate: 72.5, costPerTask: 0.69, turns: 81, source: RAMP },
+  { key: "glm-5.1", resolveRate: 71.2, costPerTask: 1.08, turns: 78, source: RAMP },
+  { key: "deepseek-v4-pro", resolveRate: 65.0, costPerTask: 0.80, turns: 55, source: RAMP },
+  { key: "qwen3.6-plus", resolveRate: 65.0, costPerTask: 0.29, turns: 107, source: RAMP },
+  { key: "qwen3.7-plus", resolveRate: 61.3, costPerTask: 0.16, turns: 54, source: RAMP },
+  { key: "gpt-5.4-mini", resolveRate: 58.8, costPerTask: 0.23, turns: 29, source: RAMP },
+  { key: "claude-4-5-haiku", resolveRate: 50.0, costPerTask: 0.51, turns: 72, source: RAMP },
+  { key: "gpt-5.4-nano", resolveRate: 48.8, costPerTask: 0.09, turns: 54, source: RAMP },
+];
+
+const RAMP_BY_KEY = new Map(RAMP_MODELS.map((entry) => [entry.key, entry]));
+
+export function findRampModel(canonicalKey: string | null | undefined): RampMeta | undefined {
+  return canonicalKey ? RAMP_BY_KEY.get(canonicalKey) : undefined;
+}

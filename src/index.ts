@@ -18,9 +18,13 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
+  AA_WILLINGNESS,
+  RAMP_WILLINGNESS,
   DEFAULT_CONFIG,
+  axisValue,
   buildAutoPool,
   decide,
+  frontierChain,
   matchesModelFilter,
   modelKey,
   resolveModel,
@@ -244,7 +248,7 @@ function selectModel(
     return { selected, profile: selected.profiles[0] ?? "balanced", reason: "forced model", alternatives: [] };
   }
 
-  const selection = selectFromPool(decision.cls, pool, context, options, cfg);
+  const selection = selectFromPool(decision, pool, context, options, cfg);
   if (!selection) throw new Error("Pi Router: model pool is empty");
   return selection;
 }
@@ -319,6 +323,7 @@ function parseForcedRoute(text: string): { route: ForcedRoute; text: string } | 
 
 function loadConfig(ctx: ExtensionContext): RouterConfig {
   let cfg = DEFAULT_CONFIG;
+  let userWillingness: Partial<RouterConfig["willingness"]> = {};
   for (const file of configPaths(ctx)) {
     if (!existsSync(file)) continue;
 
@@ -334,10 +339,16 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
         quota: { ...cfg.quota, ...(router.quota ?? {}) },
       };
+      if (router.willingness) userWillingness = { ...userWillingness, ...router.willingness };
     } catch (error) {
       ctx.ui.notify(`Pi Router: failed to read ${file}: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
   }
+
+  // The $/quality-point budgets live on different scales per source (list price vs measured cost-per-task),
+  // so the base willingness follows capabilitySource; explicit user values overlay it.
+  const baseWillingness = cfg.capabilitySource === "aa" ? AA_WILLINGNESS : RAMP_WILLINGNESS;
+  cfg = { ...cfg, willingness: { ...baseWillingness, ...userWillingness } };
   return cfg;
 }
 
@@ -359,6 +370,7 @@ function describeRouter(
 ): string {
   const lines = [
     "Pi Router",
+    `capabilitySource: ${cfg.capabilitySource}`,
     `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
     `modelFilter: include=[${cfg.modelFilter.include.join(", ") || "*"}] exclude=[${cfg.modelFilter.exclude.join(", ") || "none"}]`,
     `quota: ${cfg.quota.enabled ? "enabled" : "disabled"}`,
@@ -366,6 +378,14 @@ function describeRouter(
     `strongPool: ${pool.strongPool.map((item) => `${modelKey(item.model)}(${item.canonicalKey ?? "unknown"}/${item.costTier}/${item.profiles.join("+")})`).join(", ") || "none"}`,
     `standardPool: ${pool.standardPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
     `unknownPool: ${pool.unknownPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
+    "frontier (auto climbs these cheap→strong by hardness):",
+    ...(["coder", "deep", "balanced"] as const).map((profile) => {
+      const chain = frontierChain(pool.all, profile);
+      const points = chain
+        .map((item) => `${item.canonicalKey ?? modelKey(item.model)}(${axisValue(item, profile).toFixed(0)}@$${item.priceBlended})`)
+        .join(" → ");
+      return `  ${profile}: ${points || "none"}`;
+    }),
   ];
 
   if (lastDecision) {

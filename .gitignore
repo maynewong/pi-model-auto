@@ -5,4 +5,4 @@ dist/
 *.log
 
 # local design notes, not published
-docs/routing-redesign.md
+docs/

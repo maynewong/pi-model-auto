@@ -1,16 +1,22 @@
 import { describe, expect, it } from "vitest";
-import type { Api, Context, Model } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, Usage } from "@earendil-works/pi-ai";
 import {
   AA_WILLINGNESS,
   DEFAULT_CONFIG,
   buildAutoPool,
+  cacheAwareSelect,
+  createRoutingState,
   decide,
   normalizeModelKey,
+  recordRoutingUsage,
   resolveCanonicalModel,
   routingTurnKey,
   selectFromPool,
   shouldReuseTurnSelection,
+  userTurnIndex,
+  type ResolvedModel,
   type RouterConfig,
+  type Selection,
 } from "./router-core.ts";
 
 // The default source is `ramp`; this is the explicit `aa` counterpart for tests that exercise the
@@ -255,8 +261,8 @@ describe("canonical model routing", () => {
   });
 
   it("keeps one routing key for tool continuations within the same user turn", () => {
-    const firstRequest = context("创建 mr");
-    const continuation = toolContinuationContext("创建 mr");
+    const firstRequest = context("create mr");
+    const continuation = toolContinuationContext("create mr");
     const nextUser = {
       messages: [
         ...continuation.messages,
@@ -270,5 +276,98 @@ describe("canonical model routing", () => {
     expect(shouldReuseTurnSelection(continuation)).toBe(true);
     expect(routingTurnKey(nextUser)).not.toBe(routingTurnKey(firstRequest));
     expect(shouldReuseTurnSelection(nextUser)).toBe(false);
+  });
+});
+
+function modelCost(provider: string, id: string, cost: Partial<Model<Api>["cost"]>): Model<Api> {
+  return { ...model(provider, id), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...cost } };
+}
+
+function usage(over: Partial<Usage> = {}): Usage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    ...over,
+  };
+}
+
+function item(pool: ReturnType<typeof buildAutoPool>, canonicalKey: string): ResolvedModel {
+  const found = pool.all.find((entry) => entry.canonicalKey === canonicalKey);
+  if (!found) throw new Error(`missing ${canonicalKey}`);
+  return found;
+}
+
+function freshSelection(selected: ResolvedModel): Selection {
+  return { selected, profile: "coder", reason: "fresh pick", alternatives: [] };
+}
+
+describe("cache-aware stickiness", () => {
+  const ctx = context("hello");
+
+  it("records realized usage as a warm lease", () => {
+    const state = createRoutingState();
+    recordRoutingUsage(state, item(buildAutoPool([model("gateway", "gpt-5.5")]), "gpt-5.5"), usage({ input: 200, cacheRead: 800, totalTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 1.5 } }), ctx);
+    expect(state.lease?.modelKey).toBe("gateway/gpt-5.5");
+    expect(state.observedCacheReadRatio).toBeCloseTo(0.8);
+    expect(state.realizedCostByModel["gateway/gpt-5.5"].usd).toBeCloseTo(1.5);
+  });
+
+  it("takes the fresh pick when there is no lease", () => {
+    const pool = buildAutoPool([model("gateway", "gpt-5.5"), model("gateway", "qwen3.7-plus")]);
+    const result = cacheAwareSelect(freshSelection(item(pool, "qwen3.7-plus")), createRoutingState(), pool, ctx, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("no-lease");
+    expect(result.selection.selected.canonicalKey).toBe("qwen3.7-plus");
+  });
+
+  it("switches down when warm-read savings beat the switch tax", () => {
+    const pool = buildAutoPool([model("gateway", "gpt-5.5"), modelCost("gateway", "qwen3.7-plus", { cacheWrite: 5e-7, cacheRead: 2e-7 })]);
+    const state = createRoutingState();
+    state.lease = { modelKey: "gateway/gpt-5.5", provider: "gateway", cost: { input: 0, cacheRead: 2e-6, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
+    state.lastUsage = usage({ totalTokens: 100_000 });
+
+    const result = cacheAwareSelect(freshSelection(item(pool, "qwen3.7-plus")), state, pool, ctx, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("downgrade-break-even");
+    expect(result.selection.selected.canonicalKey).toBe("qwen3.7-plus");
+  });
+
+  it("stays on the warm lease when a downgrade does not break even", () => {
+    const pool = buildAutoPool([model("gateway", "gpt-5.5"), modelCost("gateway", "qwen3.7-plus", { cacheWrite: 3e-6, cacheRead: 2e-6 })]);
+    const state = createRoutingState();
+    state.lease = { modelKey: "gateway/gpt-5.5", provider: "gateway", cost: { input: 0, cacheRead: 2e-6, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
+    state.lastUsage = usage({ totalTokens: 100_000 });
+
+    const result = cacheAwareSelect(freshSelection(item(pool, "qwen3.7-plus")), state, pool, ctx, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("downgrade-not-worth-it");
+    expect(result.selection.selected.canonicalKey).toBe("gpt-5.5");
+  });
+
+  it("switches up when the capability gain is large", () => {
+    const pool = buildAutoPool([model("gateway", "qwen3.7-plus"), model("gateway", "gpt-5.5")]);
+    const state = createRoutingState();
+    state.lease = { modelKey: "gateway/qwen3.7-plus", provider: "gateway", cost: { input: 0, cacheRead: 1e-7, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
+    state.lastUsage = usage({ totalTokens: 100_000 });
+
+    const result = cacheAwareSelect(freshSelection(item(pool, "gpt-5.5")), state, pool, ctx, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("upgrade-quality"); // +22 resolve points
+    expect(result.selection.selected.canonicalKey).toBe("gpt-5.5");
+  });
+
+  it("stays put when an upgrade is too small to justify the tax", () => {
+    const pool = buildAutoPool([model("gateway", "claude-opus-4-8"), model("gateway", "kimi-k2.7-code")]);
+    const state = createRoutingState();
+    state.lease = { modelKey: "gateway/claude-opus-4-8", provider: "gateway", cost: { input: 0, cacheRead: 1e-7, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
+    state.lastUsage = usage({ totalTokens: 100_000 });
+
+    const result = cacheAwareSelect(freshSelection(item(pool, "kimi-k2.7-code")), state, pool, ctx, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("upgrade-not-worth-it"); // only +1.3 points
+    expect(result.selection.selected.canonicalKey).toBe("claude-opus-4-8");
+  });
+
+  it("counts user turns for the switch cooldown", () => {
+    expect(userTurnIndex(context("one"))).toBe(1);
   });
 });

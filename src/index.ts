@@ -23,18 +23,23 @@ import {
   DEFAULT_CONFIG,
   axisValue,
   buildAutoPool,
+  cacheAwareSelect,
+  createRoutingState,
   decide,
   frontierChain,
   matchesModelFilter,
   modelKey,
+  recordRoutingUsage,
   resolveModel,
   routingTurnKey,
   selectFromPool,
   shouldReuseTurnSelection,
+  type CacheReason,
   type Decision,
   type Pool,
   type ResolvedModel,
   type RouterConfig,
+  type RoutingState,
   type Selection,
   type Tier,
 } from "./router-core.ts";
@@ -61,6 +66,7 @@ interface LastDecision extends Decision {
   profile?: string;
   confidence: string;
   alternatives: string[];
+  cacheReason?: CacheReason;
 }
 
 export default function modelRouter(pi: ExtensionAPI) {
@@ -71,6 +77,7 @@ export default function modelRouter(pi: ExtensionAPI) {
   let forcedRoute: ForcedRoute | undefined;
   let lastDecision: LastDecision | undefined;
   let turnSelection: { key: string; selection: Selection } | undefined;
+  let routingState: RoutingState = createRoutingState();
   let providerRegistered = false;
 
   pi.registerCommand("router", {
@@ -87,6 +94,7 @@ export default function modelRouter(pi: ExtensionAPI) {
     quota.load(quotaStateFile());
     pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable(), cfg), cfg, ctx);
     turnSelection = undefined;
+    routingState = createRoutingState();
 
     const api = `pi-router-api:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     if (providerRegistered) pi.unregisterProvider("pi-router");
@@ -159,9 +167,22 @@ export default function modelRouter(pi: ExtensionAPI) {
         const selectionPool = forcedRoute || reuseTurnSelection
           ? pool
           : usablePoolForQuota(ctx, cfg, pool, quota, Date.now(), quotaPlans);
-        const selection = reuseTurnSelection
-          ? { ...cachedSelection.selection, reason: `${cachedSelection.selection.reason}; reused within user turn` }
-          : selectModel(decision, selectionPool, context, options, ctx, cfg);
+
+        let selection: Selection;
+        let cacheReason: CacheReason | undefined;
+        if (reuseTurnSelection) {
+          selection = { ...cachedSelection!.selection, reason: `${cachedSelection!.selection.reason}; reused within user turn` };
+        } else {
+          const fresh = selectModel(decision, selectionPool, context, options, ctx, cfg);
+          // Cache-aware stickiness only applies to auto routing (forced routes are the user's explicit choice).
+          if (!forcedRoute && decision.cls !== "model") {
+            const result = cacheAwareSelect(fresh, routingState, selectionPool, context, cfg);
+            selection = result.selection;
+            cacheReason = result.cacheReason;
+          } else {
+            selection = fresh;
+          }
+        }
         const target = selection.selected.model;
 
         if (decision.cls !== "model") turnSelection = { key: turnKey, selection };
@@ -186,6 +207,7 @@ export default function modelRouter(pi: ExtensionAPI) {
           confidence: selection.selected.confidence,
           reason: selection.reason,
           alternatives: selection.alternatives,
+          cacheReason,
         };
 
         updateRouterStatus(ctx, shortStatus(lastDecision, quota));
@@ -218,6 +240,10 @@ export default function modelRouter(pi: ExtensionAPI) {
           }
 
           stream.push(event);
+          if (event.type === "done" && cfg.cacheAware.enabled) {
+            // Re-establish the warm lease from realized usage so the next turn can weigh staying vs switching.
+            recordRoutingUsage(routingState, selection.selected, event.message.usage, context);
+          }
           if (event.type === "done" || event.type === "error") {
             logTerminalEvent(ctx, cfg, lastDecision, event);
           }
@@ -337,6 +363,7 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         tierModels: { ...cfg.tierModels, ...(router.tierModels ?? router.models ?? {}) },
         modelFilter: { ...cfg.modelFilter, ...(router.modelFilter ?? {}) },
         modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
+        cacheAware: { ...cfg.cacheAware, ...(router.cacheAware ?? {}) },
         quota: { ...cfg.quota, ...(router.quota ?? {}) },
       };
       if (router.willingness) userWillingness = { ...userWillingness, ...router.willingness };
@@ -371,6 +398,7 @@ function describeRouter(
   const lines = [
     "Pi Router",
     `capabilitySource: ${cfg.capabilitySource}`,
+    `cacheAware: ${cfg.cacheAware.enabled}`,
     `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
     `modelFilter: include=[${cfg.modelFilter.include.join(", ") || "*"}] exclude=[${cfg.modelFilter.exclude.join(", ") || "none"}]`,
     `quota: ${cfg.quota.enabled ? "enabled" : "disabled"}`,
@@ -397,6 +425,7 @@ function describeRouter(
       `  costTier: ${lastDecision.costTier}`,
       `  profile: ${lastDecision.profile ?? "unknown"}`,
       `  confidence: ${lastDecision.confidence}`,
+      `  cacheReason: ${lastDecision.cacheReason ?? "n/a"}`,
       `  reason: ${lastDecision.reason ?? "none"}`,
       `  alternatives: ${lastDecision.alternatives.join(", ") || "none"}`,
     );

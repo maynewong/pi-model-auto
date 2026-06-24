@@ -1,4 +1,4 @@
-import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai";
 import { CANONICAL_MODELS, findRampModel, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile } from "./canonical-models.ts";
 import { DEFAULT_QUOTA_CONFIG, type QuotaConfig } from "./quota.ts";
 
@@ -100,6 +100,22 @@ export interface RouterConfig {
    * agnostic. Raise a row to climb further for that hardness; `max: Infinity` = "top of frontier".
    */
   willingness: Record<Hardness, number>;
+  /**
+   * Cross-turn cache stickiness. Once a model has a warm prompt cache (a "lease"), switching to a
+   * freshly-picked model pays a cache-write tax; we only switch when the economics win — cheaper warm
+   * reads on a downgrade, or enough capability gain on an upgrade. Layered on top of the Pareto pick.
+   */
+  cacheAware: {
+    enabled: boolean;
+    /** Extra USD the downgrade's read savings must beat the switch tax by, before switching down. */
+    downgradeMarginUsd: number;
+    /** Minimum capability gain (axis points: resolve-rate / intelligence) to switch up. */
+    upgradeQualityMargin: number;
+    /** USD of switch tax that counts as one required extra quality point when upgrading. */
+    upgradeTaxPenaltyScaleUsd: number;
+    /** Minimum user turns between model switches. */
+    minTurnsBetweenSwitches: number;
+  };
   quota: QuotaConfig;
 }
 
@@ -118,6 +134,43 @@ export interface Selection {
   profile: ModelProfile;
   reason: string;
   alternatives: string[];
+}
+
+/** A warm prompt-cache hold on a model: switching away from it pays a fresh cache-write tax. */
+export interface CacheLease {
+  modelKey: string;
+  provider: string;
+  /** Raw registry cost fields for the leased model (per-token or per-1M; normalized at use). */
+  cost: { input: number; cacheRead: number; cacheWrite: number };
+  warmTokens: number;
+  establishedAtTurn: number;
+  lastUsedTurn: number;
+}
+
+/** Per-session routing memory for cache-aware stickiness. */
+export interface RoutingState {
+  lease?: CacheLease;
+  lastSwitchTurn: number;
+  observedCacheReadRatio: number;
+  realizedCostByModel: Record<string, { usd: number }>;
+  lastUsage?: Usage;
+}
+
+export type CacheReason =
+  | "disabled"
+  | "no-lease"
+  | "same-model"
+  | "switch-cooldown"
+  | "downgrade-break-even"
+  | "downgrade-not-worth-it"
+  | "upgrade-quality"
+  | "upgrade-not-worth-it";
+
+export interface CacheAwareResult {
+  selection: Selection;
+  cacheReason: CacheReason;
+  taxUsd?: number;
+  expectedSavingsUsd?: number;
 }
 
 /**
@@ -145,6 +198,13 @@ export const DEFAULT_CONFIG: RouterConfig = {
   modelOverrides: {},
   forceStrongOnHighReasoning: false,
   willingness: RAMP_WILLINGNESS,
+  cacheAware: {
+    enabled: true,
+    downgradeMarginUsd: 0.001,
+    upgradeQualityMargin: 3,
+    upgradeTaxPenaltyScaleUsd: 0.02,
+    minTurnsBetweenSwitches: 1,
+  },
   quota: DEFAULT_QUOTA_CONFIG,
 };
 
@@ -421,13 +481,13 @@ export function inferRequestedProfile(context: Context): ModelProfile {
   if (contextHasImage(context)) return "vision";
 
   const text = lastUserText(context).toLowerCase();
-  if (/\b(root cause|debug|architecture|design|plan|race condition|concurrency)\b|根因|调试|架构|设计|方案|计划|并发/.test(text)) {
+  if (/\b(root cause|debug|architecture|design|plan|race condition|concurrency)\b/.test(text)) {
     return "deep";
   }
-  if (/\b(fast|quick|high frequency|low latency|speed)\b|快速|快点|低延迟|高速/.test(text)) {
+  if (/\b(fast|quick|high frequency|low latency|speed)\b/.test(text)) {
     return "fast";
   }
-  if (/\b(code|coding|refactor|multi-file|implement|test|typescript|elixir|ruby|go)\b|代码|重构|实现|测试|多文件/.test(text)) {
+  if (/\b(code|coding|refactor|multi-file|implement|test|typescript|elixir|ruby|go)\b/.test(text)) {
     return "coder";
   }
   return "balanced";
@@ -564,6 +624,142 @@ function overflowNote(overflow: boolean): string {
   return overflow ? "; context may overflow" : "";
 }
 
+// ── Cross-turn cache-aware stickiness ────────────────────────────────────────
+// Layered on top of the Pareto pick. The Pareto pass says which model best fits this turn's
+// hardness; this pass asks whether a warm cache lease is worth keeping instead of switching to it.
+
+export function createRoutingState(): RoutingState {
+  return { lastSwitchTurn: Number.NEGATIVE_INFINITY, observedCacheReadRatio: 0, realizedCostByModel: {} };
+}
+
+/** Monotonic user-turn counter (number of user messages) — no harness turn hooks needed. */
+export function userTurnIndex(context: Context): number {
+  return context.messages.reduce((count, message) => (message.role === "user" ? count + 1 : count), 0);
+}
+
+/** Normalize a registry cost field to USD-per-token, tolerating per-token or per-1M conventions. */
+function costPerTokenUsd(cost: number): number {
+  return cost >= 0.001 ? cost / 1_000_000 : cost;
+}
+
+/**
+ * Given the fresh Pareto selection, decide whether to keep the warm lease instead. Returns the fresh
+ * pick when there is no lease, when the fresh pick already is the lease, or when an economic switch wins.
+ */
+export function cacheAwareSelect(
+  fresh: Selection,
+  state: RoutingState,
+  pool: Pool,
+  context: Context,
+  cfg: RouterConfig,
+): CacheAwareResult {
+  if (!cfg.cacheAware.enabled) return { selection: fresh, cacheReason: "disabled" };
+
+  const lease = state.lease;
+  const leaseItem = lease ? pool.all.find((item) => modelKey(item.model) === lease.modelKey) : undefined;
+  // No warm lease, or the leased model is no longer eligible (deauthed / cooled down) → take the fresh pick.
+  if (!lease || !leaseItem) return { selection: fresh, cacheReason: "no-lease" };
+  if (modelKey(fresh.selected.model) === lease.modelKey) return { selection: fresh, cacheReason: "same-model" };
+
+  const profile = fresh.profile;
+  const stay = leaseSelection(leaseItem, fresh, profile);
+
+  if (userTurnIndex(context) - state.lastSwitchTurn < cfg.cacheAware.minTurnsBetweenSwitches) {
+    return { selection: { ...stay, reason: "cache-stay: switch cooldown" }, cacheReason: "switch-cooldown" };
+  }
+
+  const contextTokens = state.lastUsage && state.lastUsage.totalTokens > 0 ? state.lastUsage.totalTokens : estimateContextTokens(context);
+  const taxUsd = switchTaxUsd(contextTokens, lease, fresh.selected);
+  const qLease = axisValue(leaseItem, profile);
+  const qFresh = axisValue(fresh.selected, profile);
+
+  if (qFresh <= qLease) {
+    const expectedSavingsUsd = expectedDowngradeSavingsUsd(contextTokens, lease, fresh.selected, state);
+    if (expectedSavingsUsd >= Math.max(0, taxUsd) + cfg.cacheAware.downgradeMarginUsd) {
+      return {
+        selection: { ...fresh, reason: `${fresh.reason}; downgrade saves ${formatUsd(expectedSavingsUsd)} > tax ${formatUsd(taxUsd)}` },
+        cacheReason: "downgrade-break-even",
+        taxUsd,
+        expectedSavingsUsd,
+      };
+    }
+    return {
+      selection: { ...stay, reason: `cache-stay: downgrade saves ${formatUsd(expectedSavingsUsd)} < tax ${formatUsd(taxUsd)}` },
+      cacheReason: "downgrade-not-worth-it",
+      taxUsd,
+      expectedSavingsUsd,
+    };
+  }
+
+  const gain = qFresh - qLease;
+  const taxPenalty = Math.max(0, taxUsd) / Math.max(cfg.cacheAware.upgradeTaxPenaltyScaleUsd, 1e-6);
+  if (gain >= cfg.cacheAware.upgradeQualityMargin + taxPenalty) {
+    return {
+      selection: { ...fresh, reason: `${fresh.reason}; upgrade +${gain.toFixed(0)}pt covers tax` },
+      cacheReason: "upgrade-quality",
+      taxUsd,
+    };
+  }
+  return {
+    selection: { ...stay, reason: `cache-stay: upgrade +${gain.toFixed(0)}pt below margin` },
+    cacheReason: "upgrade-not-worth-it",
+    taxUsd,
+  };
+}
+
+function leaseSelection(leaseItem: ResolvedModel, fresh: Selection, profile: ModelProfile): Selection {
+  const leaseKey = modelKey(leaseItem.model);
+  return {
+    selected: leaseItem,
+    profile,
+    reason: "warm cache lease",
+    alternatives: [modelKey(fresh.selected.model), ...fresh.alternatives.filter((key) => key !== leaseKey)],
+  };
+}
+
+/** Record the realized usage of a turn: refresh cache-read ratio and re-establish the lease. */
+export function recordRoutingUsage(state: RoutingState, selected: ResolvedModel, usage: Usage, context: Context): void {
+  const key = modelKey(selected.model);
+  const totalPromptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  const cacheReadRatio = totalPromptTokens > 0 ? usage.cacheRead / totalPromptTokens : 0;
+  state.observedCacheReadRatio = movingAverage(state.observedCacheReadRatio, cacheReadRatio, 0.25);
+  state.realizedCostByModel[key] = { usd: (state.realizedCostByModel[key]?.usd ?? 0) + usage.cost.total };
+  state.lastUsage = usage;
+
+  const turn = userTurnIndex(context);
+  if (state.lease && state.lease.modelKey !== key) state.lastSwitchTurn = turn;
+  state.lease = {
+    modelKey: key,
+    provider: selected.model.provider,
+    cost: { input: selected.model.cost.input, cacheRead: selected.model.cost.cacheRead, cacheWrite: selected.model.cost.cacheWrite },
+    warmTokens: totalPromptTokens,
+    establishedAtTurn: state.lease?.modelKey === key ? state.lease.establishedAtTurn : turn,
+    lastUsedTurn: turn,
+  };
+}
+
+/** Switching pays a cache-write on the candidate instead of re-reading the warm lease. */
+function switchTaxUsd(contextTokens: number, lease: CacheLease, candidate: ResolvedModel): number {
+  const stayCost = contextTokens * costPerTokenUsd(lease.cost.cacheRead);
+  const switchCost = contextTokens * costPerTokenUsd(candidate.model.cost.cacheWrite);
+  return switchCost - stayCost;
+}
+
+/** Downgrading earns cheaper warm reads for the rest of the domain. */
+function expectedDowngradeSavingsUsd(contextTokens: number, lease: CacheLease, candidate: ResolvedModel, state: RoutingState): number {
+  const warmTokens = Math.max(contextTokens * state.observedCacheReadRatio, lease.warmTokens);
+  const readDelta = Math.max(0, costPerTokenUsd(lease.cost.cacheRead) - costPerTokenUsd(candidate.model.cost.cacheRead));
+  return warmTokens * readDelta;
+}
+
+function movingAverage(previous: number, next: number, weight: number): number {
+  return previous === 0 ? next : previous * (1 - weight) + next * weight;
+}
+
+function formatUsd(value: number): string {
+  return `$${value.toFixed(6)}`;
+}
+
 export function contextHasImage(context: Context): boolean {
   return context.messages.some(
     (message) => Array.isArray(message.content) && message.content.some((part) => part.type === "image"),
@@ -642,8 +838,8 @@ function countRecentToolResults(context: Context): number {
 }
 
 function keywordScore(text: string): number {
-  const cheap = /\b(format|lint|typo|rename|docs?|readme|translate|summari[sz]e|grep|search)\b|格式化|排版|错别字|文档|翻译|总结|搜索|查找|简单/.test(text);
-  const strong = /\b(architecture|design|debug|root cause|race condition|refactor|multi-file|security|performance|concurrency|plan)\b|架构|设计|根因|并发|性能|安全|重构|复杂|方案|计划/.test(text);
+  const cheap = /\b(format|lint|typo|rename|docs?|readme|translate|summari[sz]e|grep|search)\b/.test(text);
+  const strong = /\b(architecture|design|debug|root cause|race condition|refactor|multi-file|security|performance|concurrency|plan)\b/.test(text);
   if (strong) return 1;
   if (cheap) return 0;
   return 0.45;

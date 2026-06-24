@@ -18,6 +18,8 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
+  AA_WILLINGNESS,
+  RAMP_WILLINGNESS,
   DEFAULT_CONFIG,
   axisValue,
   buildAutoPool,
@@ -321,6 +323,7 @@ function parseForcedRoute(text: string): { route: ForcedRoute; text: string } | 
 
 function loadConfig(ctx: ExtensionContext): RouterConfig {
   let cfg = DEFAULT_CONFIG;
+  let userWillingness: Partial<RouterConfig["willingness"]> = {};
   for (const file of configPaths(ctx)) {
     if (!existsSync(file)) continue;
 
@@ -334,13 +337,18 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         tierModels: { ...cfg.tierModels, ...(router.tierModels ?? router.models ?? {}) },
         modelFilter: { ...cfg.modelFilter, ...(router.modelFilter ?? {}) },
         modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
-        willingness: { ...cfg.willingness, ...(router.willingness ?? {}) },
         quota: { ...cfg.quota, ...(router.quota ?? {}) },
       };
+      if (router.willingness) userWillingness = { ...userWillingness, ...router.willingness };
     } catch (error) {
       ctx.ui.notify(`Pi Router: failed to read ${file}: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
   }
+
+  // The $/quality-point budgets live on different scales per source (list price vs measured cost-per-task),
+  // so the base willingness follows capabilitySource; explicit user values overlay it.
+  const baseWillingness = cfg.capabilitySource === "aa" ? AA_WILLINGNESS : RAMP_WILLINGNESS;
+  cfg = { ...cfg, willingness: { ...baseWillingness, ...userWillingness } };
   return cfg;
 }
 
@@ -362,6 +370,7 @@ function describeRouter(
 ): string {
   const lines = [
     "Pi Router",
+    `capabilitySource: ${cfg.capabilitySource}`,
     `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
     `modelFilter: include=[${cfg.modelFilter.include.join(", ") || "*"}] exclude=[${cfg.modelFilter.exclude.join(", ") || "none"}]`,
     `quota: ${cfg.quota.enabled ? "enabled" : "disabled"}`,

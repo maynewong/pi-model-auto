@@ -9,9 +9,9 @@ This is intentionally an **independent Pi package**, not part of the Pi core rep
 From this checkout:
 
 ```bash
-pi install /Volumes/macbook-1m2-2t/code-side/pi-model-router
+pi install /path/to/pi-model-router
 # or try once:
-pi -e /Volumes/macbook-1m2-2t/code-side/pi-model-router
+pi -e /path/to/pi-model-router
 ```
 
 Then select **Pi Router (Auto)** with `/model`.
@@ -21,6 +21,7 @@ Then select **Pi Router (Auto)** with `/model`.
 - Builds a zero-config model pool from `ctx.modelRegistry.getAvailable()`.
 - Normalizes provider SKUs to canonical model names such as `gpt-5.5`, `glm-5.2`, and `deepseek-v4-flash`.
 - Uses canonical metadata, not alphabetical order or missing provider prices, to build cheap / standard / strong / unknown pools.
+- Ranks models by capability and cost using **Ramp SWE-Bench** results by default — real agentic resolve-rate and measured per-task cost — and can switch to **Artificial Analysis** synthetic scores via `capabilitySource` (see below).
 - Selects within the strong pool by request profile: `deep`, `fast`, `coder`, `balanced`, `vision`, or `frontier`.
 - Lets you pin `cheap` / `strong` explicitly for dogfooding custom model pools.
 - Falls back to transparent single-model routing if only one model is authenticated.
@@ -56,6 +57,7 @@ No config is required for covered canonical models.
 ```jsonc
 {
   "router": {
+    "capabilitySource": "ramp",
     "threshold": 0.45,
     "weights": {
       "contextTokens": 0.25,
@@ -92,6 +94,17 @@ No config is required for covered canonical models.
   }
 }
 ```
+
+### Capability data source
+
+`capabilitySource` selects which single benchmark drives every model's capability and cost. The two sources are **never merged or cross-calibrated** — switching is wholesale, because mixing real and synthetic numbers on one scale is meaningless.
+
+- `"ramp"` (default) — **Ramp SWE-Bench** results (mini-swe-agent harness): real agentic resolve-rate and measured per-task cost. Reflects how models actually behave in multi-turn coding loops rather than synthetic benchmarks. Covers only the models Ramp has run.
+- `"aa"` — **Artificial Analysis** synthetic intelligence index + list price. Broader coverage but synthetic: it under-rates agentic/coding models and ignores real token efficiency. Use it when you route across many models Ramp has not measured and prefer uniform coverage over real-task fidelity.
+
+**Auto-route only selects models present in the active source's table** (plus any you add via `modelOverrides`). A model that is not in the table gets **no** capability score — it is **not** back-filled from the other source and **not** given a default. Such a model is unsupported for auto-routing; reach it only through a forced `@model:provider/id` route.
+
+Default is `ramp` because it measures real task outcomes. Pick the source that matches your model set; do not expect the router to blend them.
 
 `modelFilter` is optional. Use `include` / `exclude` substring filters to restrict the automatically built pool by provider, model id, display name, or canonical key. Empty `include` means allow all; `exclude` wins over `include`.
 

@@ -41,6 +41,7 @@ function resolved(provider: string, id: string, baseUrl?: string): ResolvedModel
     frontier: false,
     intelligence: 30,
     priceBlended: 1,
+    supported: true,
     confidence: "high",
     matchReason: "test",
   };

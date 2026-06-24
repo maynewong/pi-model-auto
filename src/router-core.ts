@@ -1,10 +1,12 @@
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { CANONICAL_MODELS, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile } from "./canonical-models.ts";
+import { CANONICAL_MODELS, findRampModel, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile } from "./canonical-models.ts";
 import { DEFAULT_QUOTA_CONFIG, type QuotaConfig } from "./quota.ts";
 
 export type Tier = "cheap" | "strong";
 export type RouteClass = Tier | "model";
 export type Confidence = "high" | "medium" | "low";
+/** Which benchmark drives every model's capability + cost. The two are never merged; selection is wholesale. */
+export type CapabilitySource = "aa" | "ramp";
 /** Task hardness, ordered. Sets how far up the capability frontier selection climbs (the willingness budget). */
 export type Hardness = "trivial" | "normal" | "hard" | "max";
 export const HARDNESS_ORDER: Hardness[] = ["trivial", "normal", "hard", "max"];
@@ -22,6 +24,8 @@ export interface CanonicalResolution {
   priceBlended: number;
   scores?: CanonicalScores;
   tps?: number;
+  /** Whether the active capability source has data for this model. Unsupported models are not auto-routed. */
+  supported: boolean;
   confidence: Confidence;
   reason: string;
 }
@@ -39,6 +43,8 @@ export interface ResolvedModel {
   priceBlended: number;
   scores?: CanonicalScores;
   tps?: number;
+  /** Whether the active capability source covers this model (or a user override does). Drives auto-pool inclusion. */
+  supported: boolean;
   confidence: Confidence;
   matchReason: string;
 }
@@ -68,6 +74,8 @@ export interface ModelFilter {
 }
 
 export interface RouterConfig {
+  /** Which benchmark drives capability + cost. `ramp` (default) = real SWE-bench outcomes; `aa` = synthetic. Never merged. */
+  capabilitySource: CapabilitySource;
   threshold: number;
   weights: {
     contextTokens: number;
@@ -112,7 +120,17 @@ export interface Selection {
   alternatives: string[];
 }
 
+/**
+ * Default willingness per source. The cost axis differs by source — AA is list price ($/1M tokens,
+ * ~0.5–20), Ramp is measured cost per task ($, ~0.09–2.7) — so the $/quality-point budgets are on
+ * different scales and must not be shared. `loadConfig` picks the table matching `capabilitySource`
+ * unless the user sets `willingness` explicitly.
+ */
+export const AA_WILLINGNESS: Record<Hardness, number> = { trivial: 0.1, normal: 0.4, hard: 1.0, max: Infinity };
+export const RAMP_WILLINGNESS: Record<Hardness, number> = { trivial: 0.02, normal: 0.06, hard: 0.2, max: Infinity };
+
 export const DEFAULT_CONFIG: RouterConfig = {
+  capabilitySource: "ramp",
   threshold: 0.45,
   weights: {
     contextTokens: 0.25,
@@ -126,7 +144,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
   modelFilter: { include: [], exclude: [] },
   modelOverrides: {},
   forceStrongOnHighReasoning: false,
-  willingness: { trivial: 0.1, normal: 0.4, hard: 1.0, max: Infinity },
+  willingness: RAMP_WILLINGNESS,
   quota: DEFAULT_QUOTA_CONFIG,
 };
 
@@ -135,7 +153,16 @@ export function normalizeModelKey(key: string): string {
   return withoutProvider.trim().replace(/\s*\((?:high|medium|low)\)\s*$/i, "");
 }
 
-export function resolveCanonicalModel(key: string): CanonicalResolution {
+/** Resolve-rate at/above which a Ramp model is shown as a frontier/strong-pool candidate (display only). */
+const RAMP_FRONTIER_RESOLVE = 75;
+
+function rampCostTier(costPerTask: number): CostTier {
+  if (costPerTask < 0.4) return "cheap";
+  if (costPerTask <= 1.2) return "standard";
+  return "premium";
+}
+
+export function resolveCanonicalModel(key: string, source: CapabilitySource = "ramp"): CanonicalResolution {
   const normalized = normalizeModelKey(key);
   const canonical = CANONICAL_MODELS
     .filter((entry) => normalized.includes(entry.key))
@@ -149,8 +176,42 @@ export function resolveCanonicalModel(key: string): CanonicalResolution {
       frontier: false,
       intelligence: FALLBACK_INTELLIGENCE,
       priceBlended: FALLBACK_PRICE,
+      supported: false,
       confidence: "low",
       reason: "no canonical match",
+    };
+  }
+
+  if (source === "ramp") {
+    const ramp = findRampModel(canonical.key);
+    if (!ramp) {
+      // Canonical name is known, but Ramp never measured it — unsupported for auto-routing under `ramp`.
+      return {
+        canonical,
+        costTier: canonical.costTier,
+        profiles: canonical.profiles,
+        frontier: false,
+        intelligence: FALLBACK_INTELLIGENCE,
+        priceBlended: FALLBACK_PRICE,
+        supported: false,
+        confidence: "low",
+        reason: `no Ramp result for ${canonical.key}`,
+      };
+    }
+    // One real outcome (resolve-rate) is the axis for every profile; mirror it into the per-profile scores.
+    const scores: CanonicalScores = { coding: ramp.resolveRate, agentic: ramp.resolveRate / 100 };
+    return {
+      canonical,
+      costTier: rampCostTier(ramp.costPerTask),
+      profiles: canonical.profiles,
+      frontier: ramp.resolveRate >= RAMP_FRONTIER_RESOLVE,
+      intelligence: ramp.resolveRate,
+      priceBlended: ramp.costPerTask,
+      scores,
+      tps: undefined,
+      supported: true,
+      confidence: "high",
+      reason: `Ramp: ${canonical.key} ${ramp.resolveRate}%@$${ramp.costPerTask}`,
     };
   }
 
@@ -163,6 +224,7 @@ export function resolveCanonicalModel(key: string): CanonicalResolution {
     priceBlended: canonical.priceBlended,
     scores: canonical.scores,
     tps: canonical.tps,
+    supported: true,
     confidence: "high",
     reason: `canonical match: ${canonical.key}`,
   };
@@ -177,6 +239,8 @@ export function buildAutoPool(models: Model<Api>[], cfg: RouterConfig = DEFAULT_
     .filter((model) => model.provider !== "pi-router")
     .filter((model) => model.input?.includes("text"))
     .map((model) => resolveModel(model, cfg))
+    // A model the active source has no data for (and no override) is not auto-routed.
+    .filter((model) => model.supported)
     .filter((model) => matchesModelFilter(model, cfg.modelFilter))
     .sort(compareResolvedModels);
 
@@ -191,7 +255,7 @@ export function buildAutoPool(models: Model<Api>[], cfg: RouterConfig = DEFAULT_
 
 export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONFIG): ResolvedModel {
   const key = modelKey(model);
-  const resolution = resolveCanonicalModel(key);
+  const resolution = resolveCanonicalModel(key, cfg.capabilitySource);
   const override = findModelOverride(cfg, key, resolution.canonical?.key ?? null);
 
   if (override) {
@@ -206,6 +270,8 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
       priceBlended: override.priceBlended ?? blendedPriceFromCost(model) ?? resolution.priceBlended,
       scores: override.scores ?? resolution.scores,
       tps: override.tps ?? resolution.tps,
+      // An explicit override always makes the model routable, even when the active source lacks data.
+      supported: true,
       confidence: resolution.canonical ? "medium" : "high",
       matchReason: resolution.canonical
         ? `user override + ${resolution.reason}`
@@ -221,9 +287,10 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
     profiles: resolution.profiles,
     frontier: resolution.frontier,
     intelligence: resolution.intelligence,
-    priceBlended: resolution.canonical ? resolution.priceBlended : (blendedPriceFromCost(model) ?? resolution.priceBlended),
+    priceBlended: resolution.supported ? resolution.priceBlended : (blendedPriceFromCost(model) ?? resolution.priceBlended),
     scores: resolution.scores,
     tps: resolution.tps,
+    supported: resolution.supported,
     confidence: resolution.confidence,
     matchReason: resolution.reason,
   };

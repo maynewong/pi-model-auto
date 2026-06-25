@@ -1,10 +1,26 @@
 {
-  "name": "pi-model-router",
+  "name": "pi-model-auto",
   "version": "0.1.0",
   "description": "Pi extension package that routes each turn to cheap or strong authenticated models.",
   "type": "module",
   "keywords": ["pi-package", "pi", "extension", "model-router"],
   "license": "MIT",
+  "homepage": "https://github.com/maynewong/pi-model-router#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maynewong/pi-model-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/maynewong/pi-model-router/issues"
+  },
+  "files": [
+    "src/index.ts",
+    "src/router-core.ts",
+    "src/quota.ts",
+    "src/canonical-models.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": ["./src/index.ts"]
   },
@@ -19,6 +35,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest --run"
+    "test": "vitest --run",
+    "prepublishOnly": "npm run typecheck && npm test",
+    "release": "npm version patch && git push --follow-tags && npm publish"
   }
 }

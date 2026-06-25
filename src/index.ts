@@ -30,6 +30,7 @@ import {
   matchesModelFilter,
   modelKey,
   recordRoutingUsage,
+  repriceForTimeOfDay,
   resolveModel,
   routingTurnKey,
   selectFromPool,
@@ -80,10 +81,10 @@ export default function modelRouter(pi: ExtensionAPI) {
   let routingState: RoutingState = createRoutingState();
   let providerRegistered = false;
 
-  pi.registerCommand("router", {
+  pi.registerCommand("auto", {
     description: "Show Pi Model Router pool and last decision",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(describeRouter(pool, cfg, lastDecision, quota), "info");
+      ctx.ui.notify(describeRouter(repriceForTimeOfDay(pool, new Date().getHours()), cfg, lastDecision, quota), "info");
     },
   });
 
@@ -164,9 +165,14 @@ export default function modelRouter(pi: ExtensionAPI) {
         const cachedSelection = turnSelection;
         const reuseTurnSelection =
           decision.cls !== "model" && shouldReuseTurnSelection(context) && cachedSelection?.key === turnKey;
-        const selectionPool = forcedRoute || reuseTurnSelection
+        // Re-evaluate time-of-day shadow-price windows once per turn (clock read here, pick reused
+        // within the turn), so a window boundary like GLM 14:00–18:00 takes effect without a /reload.
+        const selectionPool = decision.cls === "model" || reuseTurnSelection
           ? pool
-          : usablePoolForQuota(ctx, cfg, pool, quota, Date.now(), quotaPlans);
+          : repriceForTimeOfDay(
+            forcedRoute ? pool : usablePoolForQuota(ctx, cfg, pool, quota, Date.now(), quotaPlans),
+            new Date().getHours(),
+          );
 
         let selection: Selection;
         let cacheReason: CacheReason | undefined;

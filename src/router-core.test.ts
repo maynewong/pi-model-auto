@@ -9,6 +9,8 @@ import {
   decide,
   normalizeModelKey,
   recordRoutingUsage,
+  repriceForTimeOfDay,
+  timeCostMultiplier,
   resolveCanonicalModel,
   routingTurnKey,
   selectFromPool,
@@ -25,6 +27,10 @@ const AA: RouterConfig = { ...DEFAULT_CONFIG, capabilitySource: "aa", willingnes
 
 function strongDecision(ctx: Context, cfg: RouterConfig = DEFAULT_CONFIG) {
   return decide(ctx, undefined, { tier: "strong" }, cfg);
+}
+
+function cheapDecision(ctx: Context, cfg: RouterConfig = DEFAULT_CONFIG) {
+  return decide(ctx, undefined, { tier: "cheap" }, cfg);
 }
 
 function model(provider: string, id: string): Model<Api> {
@@ -258,6 +264,64 @@ describe("canonical model routing", () => {
     expect(pick({ reasoning: "medium" })).toBe("kimi-k2.7-code");
     expect(pick({ reasoning: "high" })).toBe("gpt-5.5");
     expect(pick({ reasoning: "xhigh" })).toBe("claude-fable-5");
+  });
+
+  it("scales the cost axis by the shadow-price coefficient", () => {
+    expect(item(buildAutoPool([model("gateway", "glm-5.2")]), "glm-5.2").priceBlended).toBe(1.88);
+
+    const discounted = buildAutoPool([model("gateway", "glm-5.2")], {
+      ...DEFAULT_CONFIG,
+      modelOverrides: { "gateway/glm-5.2": { costCoef: 0.25 } },
+    });
+    expect(item(discounted, "glm-5.2").priceBlended).toBeCloseTo(0.47);
+  });
+
+  it("lets a paid subscription win cheap turns it would lose at measured cost", () => {
+    // gpt-5.4 (72.5@$0.66) vs glm-5.2 (80@$1.88): at list cost an easy coder turn takes the cheap gpt-5.4.
+    const models = [model("gateway-codex", "gpt-5.4"), model("gateway", "glm-5.2")];
+    const coder = context("implement a typescript helper");
+    const pick = (cfg: RouterConfig) =>
+      selectFromPool(decide(coder, undefined, undefined, cfg), buildAutoPool(models, cfg), coder, undefined, cfg)?.selected.canonicalKey;
+
+    expect(pick(DEFAULT_CONFIG)).toBe("gpt-5.4");
+
+    // Price GLM as an already-paid subscription (coef 0.2 → $0.376): now it dominates and wins.
+    const withSub: RouterConfig = { ...DEFAULT_CONFIG, modelOverrides: { "gateway/glm-5.2": { costCoef: 0.2 } } };
+    expect(pick(withSub)).toBe("glm-5.2");
+  });
+
+  it("keeps the build-time price time-neutral and re-applies windows per turn", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: { "gateway/glm-5.2": { costCoef: 0.2, costCoefHours: [{ hours: [14, 18], factor: 3 }] } },
+    };
+    // Build is time-neutral: base coef only, no clock baked in.
+    const pool = buildAutoPool([model("gateway", "glm-5.2")], cfg);
+    expect(item(pool, "glm-5.2").priceBlended).toBeCloseTo(1.88 * 0.2);
+
+    // Per-turn reprice applies the window without rebuilding: 10:00 off-peak, 15:00 inside the 3× window.
+    expect(item(repriceForTimeOfDay(pool, 10), "glm-5.2").priceBlended).toBeCloseTo(1.88 * 0.2);
+    expect(item(repriceForTimeOfDay(pool, 15), "glm-5.2").priceBlended).toBeCloseTo(1.88 * 0.6);
+  });
+
+  it("applies time-of-day repricing to forced @cheap tier selection", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: { "gateway/glm-5.2": { costCoef: 0.2, costCoefHours: [{ hours: [14, 18], factor: 3 }] } },
+    };
+    const pool = buildAutoPool([model("gateway-codex", "gpt-5.4"), model("gateway", "glm-5.2")], cfg);
+    const coder = context("implement a typescript helper");
+
+    expect(selectFromPool(cheapDecision(coder, cfg), pool, coder, undefined, cfg)?.selected.canonicalKey).toBe("glm-5.2");
+    expect(selectFromPool(cheapDecision(coder, cfg), repriceForTimeOfDay(pool, 15), coder, undefined, cfg)?.selected.canonicalKey).toBe("gpt-5.4");
+  });
+
+  it("computes the time multiplier, including wraparound windows", () => {
+    const windows = [{ hours: [22, 2] as [number, number], factor: 2 }];
+    expect(timeCostMultiplier(windows, 23)).toBe(2);
+    expect(timeCostMultiplier(windows, 1)).toBe(2);
+    expect(timeCostMultiplier(windows, 12)).toBe(1);
+    expect(timeCostMultiplier(undefined, 23)).toBe(1);
   });
 
   it("keeps one routing key for tool continuations within the same user turn", () => {

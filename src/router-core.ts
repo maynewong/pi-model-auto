@@ -47,6 +47,9 @@ export interface ResolvedModel {
   supported: boolean;
   confidence: Confidence;
   matchReason: string;
+  /** Time-of-day shadow-price windows, carried through so the price can be re-evaluated per turn
+   *  (see `repriceForTimeOfDay`) without rebuilding the pool. `priceBlended` here is time-neutral. */
+  costCoefHours?: CostCoefWindow[];
 }
 
 export interface Pool {
@@ -59,13 +62,30 @@ export interface Pool {
 
 export interface ModelOverride {
   canonical?: string;
-  costTier: CostTier;
+  costTier?: CostTier;
   profiles?: ModelProfile[];
   frontier?: boolean;
   intelligence?: number;
   priceBlended?: number;
   scores?: CanonicalScores;
   tps?: number;
+  /**
+   * Shadow-price coefficient: multiplies the model's base cost-axis price (Ramp cost-per-task under
+   * `ramp`). It folds *my* economics into the shared capability frontier without touching the quality
+   * axis, and stays dimensionless so it can never put the axis into a foreign unit. <1 = cheaper to me
+   * than Ramp measured (an already-paid subscription, a discounted PAYG deal); >1 = pricier. Default 1
+   * = pure Ramp. Keep a shared/finite subscription a *positive* shadow price, not ~0: a near-zero coef
+   * makes an already-strong model dominate the whole frontier and starves the cheap PAYG floor.
+   */
+  costCoef?: number;
+  /** Time-of-day multipliers stacked on `costCoef` (e.g. GLM burns 3× quota 14:00–18:00). */
+  costCoefHours?: CostCoefWindow[];
+}
+
+export interface CostCoefWindow {
+  /** [start, end) in local 24h hours; wraps when start > end (e.g. [22, 2] = 22:00–02:00). */
+  hours: [number, number];
+  factor: number;
 }
 
 export interface ModelFilter {
@@ -317,17 +337,23 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
   const key = modelKey(model);
   const resolution = resolveCanonicalModel(key, cfg.capabilitySource);
   const override = findModelOverride(cfg, key, resolution.canonical?.key ?? null);
+  // The base shadow-price coefficient folds the caller's real economics into the shared frontier: it
+  // scales whatever base cost the source/override resolved, staying dimensionless so the axis keeps one
+  // unit. Time-of-day windows are NOT folded here — they are re-applied per turn in repriceForTimeOfDay
+  // so the clock can cross a window boundary mid-session without a pool rebuild.
+  const coef = override?.costCoef ?? 1;
 
   if (override) {
+    const base = override.priceBlended ?? blendedPriceFromCost(model) ?? resolution.priceBlended;
     return {
       model,
       acceptsImage: model.input?.includes("image") ?? false,
       canonicalKey: override.canonical ?? resolution.canonical?.key ?? normalizeModelKey(key),
-      costTier: override.costTier,
+      costTier: override.costTier ?? resolution.costTier,
       profiles: override.profiles ?? resolution.profiles,
       frontier: override.frontier ?? resolution.frontier,
       intelligence: override.intelligence ?? resolution.intelligence,
-      priceBlended: override.priceBlended ?? blendedPriceFromCost(model) ?? resolution.priceBlended,
+      priceBlended: base * coef,
       scores: override.scores ?? resolution.scores,
       tps: override.tps ?? resolution.tps,
       // An explicit override always makes the model routable, even when the active source lacks data.
@@ -336,9 +362,11 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
       matchReason: resolution.canonical
         ? `user override + ${resolution.reason}`
         : "user override for unknown model",
+      costCoefHours: override.costCoefHours,
     };
   }
 
+  const base = resolution.supported ? resolution.priceBlended : (blendedPriceFromCost(model) ?? resolution.priceBlended);
   return {
     model,
     acceptsImage: model.input?.includes("image") ?? false,
@@ -347,13 +375,49 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
     profiles: resolution.profiles,
     frontier: resolution.frontier,
     intelligence: resolution.intelligence,
-    priceBlended: resolution.supported ? resolution.priceBlended : (blendedPriceFromCost(model) ?? resolution.priceBlended),
+    priceBlended: base * coef,
     scores: resolution.scores,
     tps: resolution.tps,
     supported: resolution.supported,
     confidence: resolution.confidence,
     matchReason: resolution.reason,
   };
+}
+
+/** Product of the time-of-day window factors active at `nowHour` (1 when none apply). */
+export function timeCostMultiplier(windows: CostCoefWindow[] | undefined, nowHour: number): number {
+  if (!windows) return 1;
+  let mult = 1;
+  for (const window of windows) {
+    if (hourInRange(nowHour, window.hours[0], window.hours[1])) mult *= window.factor;
+  }
+  return mult;
+}
+
+/**
+ * Re-apply each model's time-of-day shadow-price windows against `nowHour`, returning a pool with
+ * updated prices. Called once per user turn at the selection boundary (where the clock is read), so a
+ * window like GLM's 14:00–18:00 3× starts and stops biting as time passes — no `/reload` needed. The
+ * caller reads the clock once per turn and reuses the pick within the turn, so prices stay stable
+ * across a turn's tool continuations.
+ */
+export function repriceForTimeOfDay(pool: Pool, nowHour: number): Pool {
+  const reprice = (item: ResolvedModel): ResolvedModel => {
+    const mult = timeCostMultiplier(item.costCoefHours, nowHour);
+    return mult === 1 ? item : { ...item, priceBlended: item.priceBlended * mult };
+  };
+  return {
+    cheapPool: pool.cheapPool.map(reprice),
+    standardPool: pool.standardPool.map(reprice),
+    strongPool: pool.strongPool.map(reprice),
+    unknownPool: pool.unknownPool.map(reprice),
+    all: pool.all.map(reprice),
+  };
+}
+
+/** Whether `hour` falls in the half-open window [start, end), wrapping past midnight when start > end. */
+function hourInRange(hour: number, start: number, end: number): boolean {
+  return start <= end ? hour >= start && hour < end : hour >= start || hour < end;
 }
 
 /** Best-effort list price ($/1M tokens, blended 3:1) from the registry's per-token cost, when present. */

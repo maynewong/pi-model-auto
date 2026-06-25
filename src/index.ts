@@ -405,7 +405,6 @@ function describeRouter(
     "Pi Router",
     `capabilitySource: ${cfg.capabilitySource}`,
     `cacheAware: ${cfg.cacheAware.enabled}`,
-    `forceStrongOnHighReasoning: ${cfg.forceStrongOnHighReasoning}`,
     `modelFilter: include=[${cfg.modelFilter.include.join(", ") || "*"}] exclude=[${cfg.modelFilter.exclude.join(", ") || "none"}]`,
     `quota: ${cfg.quota.enabled ? "enabled" : "disabled"}`,
     `cheapPool: ${pool.cheapPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,

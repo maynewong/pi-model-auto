@@ -123,6 +123,8 @@ Quality comes from one benchmark table. Cost starts from the same table, then ap
 
 The numeric tables live in [`src/canonical-models.ts`](src/canonical-models.ts). The two sources are not mixed.
 
+Task difficulty is judged from the request itself — context size, prompt length, keywords, and tool activity — never from your thinking level. Your thinking level (`low`/`medium`/`high`/`xhigh`) controls only how deeply the *chosen* model reasons; it does not change which model is chosen. So leaving thinking on `high` out of habit won't silently push every turn to the most expensive model. When you know a task is harder than it looks, say so in the prompt (or pin with `@strong`).
+
 One user turn keeps one model, including tool-call continuations. Automatic routing also avoids quota-cooled plans and avoids switching away from a useful warm cache when the switch is not worth it.
 
 ## Settings
@@ -136,7 +138,6 @@ One user turn keeps one model, including tool-call continuations. Automatic rout
 | `willingness` | Control how far each difficulty climbs toward stronger models. |
 | `cacheAware` | Keep warm prompt caches when switching is not worth it. Enabled by default. |
 | `quota` | Skip cooled-down plans after rate-limit headers or `429`. Enabled by default. |
-| `forceStrongOnHighReasoning` | Send `high` or `xhigh` reasoning to the top of the frontier. |
 | `weights` | Difficulty-scoring weights. Advanced. |
 | `log` | Append routing decisions to `.pi/router.log`. |
 

@@ -101,7 +101,6 @@ export interface RouterConfig {
     contextTokens: number;
     lastUserLen: number;
     keyword: number;
-    reasoning: number;
     toolDensity: number;
   };
   log: boolean;
@@ -110,12 +109,11 @@ export interface RouterConfig {
   modelFilter: ModelFilter;
   /** User-supplied metadata for unknown/private/local models. Keys may be provider/id, model id, or normalized model id. */
   modelOverrides: Record<string, ModelOverride>;
-  forceStrongOnHighReasoning: boolean;
   /**
    * Willingness to pay for capability, by task hardness: the max extra list-price ($/1M) spent for
    * one more point of quality on the chosen axis. Selection walks the Pareto frontier from the
    * cheapest point upward, taking each step whose marginal $/quality-point is within budget — so the
-   * hardness signal (driven by reasoning level) positions us on the frontier and steep low-value
+   * hardness signal (driven by task content) positions us on the frontier and steep low-value
    * steps (a near-tie flagship at 2× price) are only taken at `max`. The single routing knob, axis-
    * agnostic. Raise a row to climb further for that hardness; `max: Infinity` = "top of frontier".
    */
@@ -206,17 +204,15 @@ export const DEFAULT_CONFIG: RouterConfig = {
   capabilitySource: "ramp",
   threshold: 0.45,
   weights: {
-    contextTokens: 0.25,
-    lastUserLen: 0.15,
-    keyword: 0.35,
-    reasoning: 0.15,
+    contextTokens: 0.3,
+    lastUserLen: 0.18,
+    keyword: 0.42,
     toolDensity: 0.1,
   },
   log: false,
   tierModels: {},
   modelFilter: { include: [], exclude: [] },
   modelOverrides: {},
-  forceStrongOnHighReasoning: false,
   willingness: RAMP_WILLINGNESS,
   cacheAware: {
     enabled: true,
@@ -490,8 +486,8 @@ export function decide(
     };
   }
 
-  const score = classify(context, options, cfg);
-  const hardnessBucket = autoHardnessBucket(score, options);
+  const score = classify(context, cfg);
+  const hardnessBucket = autoHardnessBucket(score);
   return {
     cls: hardnessBucket >= 2 ? "strong" : "cheap",
     score,
@@ -504,38 +500,22 @@ export function decide(
 /**
  * Continuous task-hardness bucket (index into HARDNESS_ORDER) for auto mode. The bucket — not a
  * binary cheap/strong split — drives the capability floor, so the whole frontier (incl. mid-tier
- * models) becomes reachable. Reasoning level is an explicit floor *guarantee*: it can only raise it.
+ * models) becomes reachable. Driven purely by task content: the thinking level is a passthrough that
+ * controls how deeply the *chosen* model reasons, never which model is chosen.
  */
-export function autoHardnessBucket(score: number, options: SimpleStreamOptions | undefined): number {
-  const scoreBucket = score < 0.30 ? 0 : score < 0.52 ? 1 : score < 0.74 ? 2 : 3;
-  const reasoningBucket = reasoningFloorBucket(options?.reasoning);
-  return Math.max(scoreBucket, reasoningBucket);
+export function autoHardnessBucket(score: number): number {
+  return score < 0.3 ? 0 : score < 0.52 ? 1 : score < 0.74 ? 2 : 3;
 }
 
-function reasoningFloorBucket(reasoning: SimpleStreamOptions["reasoning"] | undefined): number {
-  switch (reasoning) {
-    case "medium":
-      return 1;
-    case "high":
-      return 2;
-    case "xhigh":
-      return 3;
-    default:
-      return 0; // off / low
-  }
-}
-
-export function classify(context: Context, options: SimpleStreamOptions | undefined, cfg: RouterConfig): number {
+export function classify(context: Context, cfg: RouterConfig): number {
   const text = lastUserText(context).toLowerCase();
   const contextTokens = estimateContextTokens(context);
-  const reasoning = options?.reasoning && ["medium", "high", "xhigh"].includes(options.reasoning) ? 1 : 0;
   const toolDensity = Math.min(1, countRecentToolResults(context) / 8);
 
   const raw =
     normalize(contextTokens, 8_000, 120_000) * cfg.weights.contextTokens +
     normalize(text.length, 120, 1_200) * cfg.weights.lastUserLen +
     keywordScore(text) * cfg.weights.keyword +
-    reasoning * cfg.weights.reasoning +
     toolDensity * cfg.weights.toolDensity;
 
   return Math.max(0, Math.min(1, raw));
@@ -641,10 +621,7 @@ export function selectFromPool(
   const { eligible, overflow } = eligibleModels(pool, context);
   if (eligible.length === 0) return undefined;
 
-  let bucket = decision.hardnessBucket;
-  if (cfg.forceStrongOnHighReasoning && (options?.reasoning === "high" || options?.reasoning === "xhigh")) {
-    bucket = HARDNESS_ORDER.length - 1;
-  }
+  const bucket = decision.hardnessBucket;
   const hardness = HARDNESS_ORDER[Math.max(0, Math.min(HARDNESS_ORDER.length - 1, bucket))];
 
   // `fast` is orthogonal: gate on a low capability floor, then maximize throughput.

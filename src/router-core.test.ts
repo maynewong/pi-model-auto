@@ -219,6 +219,21 @@ describe("canonical model routing", () => {
     expect(selectFromPool(strongDecision(fast, AA), pool, fast, undefined, AA)?.selected.canonicalKey).toBe("kimi-k2.7-code-highspeed");
   });
 
+  // Hardness drives the climb directly (content-derived in production); reasoning level never does.
+  const pickAtBucket = (
+    pool: ReturnType<typeof buildAutoPool>,
+    ctx: Context,
+    cfg: RouterConfig,
+    bucket: number,
+  ) =>
+    selectFromPool(
+      { cls: bucket >= 2 ? "strong" : "cheap", score: 0, chosen: "", hardnessBucket: bucket },
+      pool,
+      ctx,
+      undefined,
+      cfg,
+    )?.selected.canonicalKey;
+
   it("climbs the frontier by hardness so the whole spread is reachable (aa)", () => {
     const pool = buildAutoPool(
       [
@@ -232,16 +247,14 @@ describe("canonical model routing", () => {
       AA,
     );
     const coder = context("implement a typescript helper");
+    const pick = (bucket: number) => pickAtBucket(pool, coder, AA, bucket);
 
-    const pick = (opts: { reasoning: "medium" | "high" | "xhigh" } | undefined) =>
-      selectFromPool(decide(coder, opts, undefined, AA), pool, coder, opts, AA)?.selected.canonicalKey;
-
-    // off → cheap end; medium → mid value point (pro→kimi step too steep to climb past);
-    // high → glm; xhigh → top of frontier.
-    expect(pick(undefined)).toBe("deepseek-v4-flash");
-    expect(pick({ reasoning: "medium" })).toBe("deepseek-v4-pro");
-    expect(pick({ reasoning: "high" })).toBe("glm-5.2");
-    expect(pick({ reasoning: "xhigh" })).toBe("gpt-5.5");
+    // trivial → cheap end; normal → mid value point (pro→kimi step too steep to climb past);
+    // hard → glm; max → top of frontier.
+    expect(pick(0)).toBe("deepseek-v4-flash");
+    expect(pick(1)).toBe("deepseek-v4-pro");
+    expect(pick(2)).toBe("glm-5.2");
+    expect(pick(3)).toBe("gpt-5.5");
   });
 
   it("climbs the Ramp frontier by hardness on real resolve-rate (default source)", () => {
@@ -255,15 +268,35 @@ describe("canonical model routing", () => {
       model("anthropic", "claude-fable-5"),
     ]);
     const coder = context("implement a typescript helper");
-
-    const pick = (opts: { reasoning: "medium" | "high" | "xhigh" } | undefined) =>
-      selectFromPool(decide(coder, opts, undefined, DEFAULT_CONFIG), pool, coder, opts, DEFAULT_CONFIG)?.selected.canonicalKey;
+    const pick = (bucket: number) => pickAtBucket(pool, coder, DEFAULT_CONFIG, bucket);
 
     // Real Ramp frontier: nano → qwen3.7 → qwen3.6 → gpt-5.4 → kimi-k2.7-code → gpt-5.5 → fable.
-    expect(pick(undefined)).toBe("qwen3.7-plus");
-    expect(pick({ reasoning: "medium" })).toBe("kimi-k2.7-code");
-    expect(pick({ reasoning: "high" })).toBe("gpt-5.5");
-    expect(pick({ reasoning: "xhigh" })).toBe("claude-fable-5");
+    expect(pick(0)).toBe("qwen3.7-plus");
+    expect(pick(1)).toBe("kimi-k2.7-code");
+    expect(pick(2)).toBe("gpt-5.5");
+    expect(pick(3)).toBe("claude-fable-5");
+  });
+
+  it("ignores thinking level when selecting a model (reasoning is passthrough only)", () => {
+    const pool = buildAutoPool([
+      model("gateway", "qwen3.7-plus"),
+      model("gateway-codex", "gpt-5.4"),
+      model("gateway", "glm-5.2"),
+      model("gateway-codex", "gpt-5.5"),
+    ]);
+    const coder = context("implement a typescript helper");
+    const pick = (reasoning?: "medium" | "high" | "xhigh") => {
+      const opts = reasoning ? { reasoning } : undefined;
+      return selectFromPool(decide(coder, opts, undefined, DEFAULT_CONFIG), pool, coder, opts, DEFAULT_CONFIG)
+        ?.selected.canonicalKey;
+    };
+
+    // Same content + same pool ⇒ same model, regardless of how deep the chosen model is told to think.
+    const base = pick(undefined);
+    expect(base).toBeDefined();
+    expect(pick("medium")).toBe(base);
+    expect(pick("high")).toBe(base);
+    expect(pick("xhigh")).toBe(base);
   });
 
   it("scales the cost axis by the shadow-price coefficient", () => {

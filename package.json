@@ -1,9 +1,14 @@
 {
   "name": "pi-model-auto",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension package that routes each turn to cheap or strong authenticated models.",
   "type": "module",
-  "keywords": ["pi-package", "pi", "extension", "model-router"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "model-router"
+  ],
   "license": "MIT",
   "homepage": "https://github.com/maynewong/pi-model-auto#readme",
   "repository": {
@@ -22,7 +27,9 @@
     "LICENSE"
   ],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

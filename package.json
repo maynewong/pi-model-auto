@@ -5,13 +5,13 @@
   "type": "module",
   "keywords": ["pi-package", "pi", "extension", "model-router"],
   "license": "MIT",
-  "homepage": "https://github.com/maynewong/pi-model-router#readme",
+  "homepage": "https://github.com/maynewong/pi-model-auto#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/maynewong/pi-model-router.git"
+    "url": "git+https://github.com/maynewong/pi-model-auto.git"
   },
   "bugs": {
-    "url": "https://github.com/maynewong/pi-model-router/issues"
+    "url": "https://github.com/maynewong/pi-model-auto/issues"
   },
   "files": [
     "src/index.ts",

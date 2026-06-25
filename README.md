@@ -1,6 +1,6 @@
-# pi-model-router
+# pi-model-auto
 
-`pi-model-router` adds one Pi model: **Pi Router (Auto)**.
+`pi-model-auto` adds one Pi model: **Pi Router (Auto)**.
 
 Choose it once with `/model`. After that, Pi keeps using the router, and the router chooses one of your authenticated models for each turn.
 
@@ -15,7 +15,7 @@ pi install npm:pi-model-auto
 Or install from git (pin a release with `@vX.Y.Z`, or omit it to track the default branch):
 
 ```bash
-pi install git:github.com/maynewong/pi-model-router@v0.1.0
+pi install git:github.com/maynewong/pi-model-auto@v0.1.0
 ```
 
 Update later with `pi update --extensions`.
@@ -23,7 +23,7 @@ Update later with `pi update --extensions`.
 To try it once without installing, point `-e` at a local checkout:
 
 ```bash
-pi -e /path/to/pi-model-router
+pi -e /path/to/pi-model-auto
 ```
 
 Then:
@@ -73,11 +73,10 @@ Project config overrides user config.
 ```jsonc
 {
   "router": {
-    "modelFilter": { "include": ["openai", "anthropic", "google"], "exclude": [] },
+    "modelFilter": { "include": ["anthropic", "z-ai"], "exclude": [] },
     "modelOverrides": {
       "anthropic/claude-3-5-sonnet-20241022": { "costCoef": 0.05 },
-      "openai/gpt-4o-mini": { "costCoef": 1.0 },
-      "google/gemini-1.5-flash": {
+      "z-ai/glm-5.2": {
         "costCoef": 0.4,
         "costCoefHours": [{ "hours": [14, 18], "factor": 3 }]
       }
@@ -103,7 +102,7 @@ Avoid setting a limited subscription near zero unless you want it to win almost 
 Use this when a model is more expensive during local hours:
 
 ```jsonc
-"google/gemini-1.5-flash": {
+"z-ai/glm-5.2": {
   "costCoef": 0.4,
   "costCoefHours": [{ "hours": [14, 18], "factor": 3 }]
 }
@@ -119,7 +118,7 @@ Quality comes from one benchmark table. Cost starts from the same table, then ap
 
 `capabilitySource` chooses the benchmark:
 
-- `"ramp"` (default): this package's Ramp SWE-Bench table, using coding-agent resolve rate and measured cost per task. It is a narrow coding-agent slice, not a general model score. The task family follows [SWE-bench](https://arxiv.org/abs/2310.06770).
+- `"ramp"` (default): this package's [Ramp SWE-Bench](https://labs.ramp.com/swebench#score-vs-spend) table, using coding-agent resolve rate and measured cost per task. It is a narrow coding-agent slice, not a general model score. The task family follows [SWE-bench](https://arxiv.org/abs/2310.06770).
 - `"aa"`: [Artificial Analysis](https://artificialanalysis.ai/models) model data, using its Intelligence Index and blended price metrics.
 
 The numeric tables live in [`src/canonical-models.ts`](src/canonical-models.ts). The two sources are not mixed.
@@ -162,39 +161,4 @@ npm run typecheck
 npm test
 ```
 
-## Release
-
-This package ships from one source tree to two channels: npm (`npm:pi-model-auto`)
-and git (`git:github.com/maynewong/pi-model-router`). One version bump feeds both.
-
-One-shot from a clean `main`:
-
-```bash
-npm run release        # version patch -> push commit + tag -> npm publish
-```
-
-`release` runs `npm version patch`, which bumps `version`, commits, and creates a
-`vX.Y.Z` git tag; `git push --follow-tags` publishes the tag for git installers;
-`npm publish` ships to npm. `prepublishOnly` runs `typecheck` and the test suite
-first, so a failing build blocks the publish.
-
-For a minor or major release, bump by hand and reuse the rest:
-
-```bash
-npm version minor      # or: major
-git push --follow-tags
-npm publish
-```
-
-Check what npm will ship before the first publish:
-
-```bash
-npm publish --dry-run  # lists the files in the tarball
-```
-
-The `files` allowlist in `package.json` limits the tarball to the four runtime
-modules plus `README.md` and `LICENSE`; tests and config stay out.
-
-After release, users on either channel update with `pi update --extensions`. npm
-installs move by semver; git installs pinned to a tag stay put until the user
-installs a newer tag.
+Maintainers: see [RELEASING.md](RELEASING.md) for the publish flow.

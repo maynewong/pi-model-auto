@@ -1,6 +1,9 @@
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { Api, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai";
 import { CANONICAL_MODELS, findRampModel, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile } from "./canonical-models.ts";
-import { DEFAULT_QUOTA_CONFIG, type QuotaConfig } from "./quota.ts";
+import { DEFAULT_QUOTA_CONFIG, filterPoolByQuotaPlanPrefix, QuotaState, type QuotaConfig } from "./quota.ts";
 
 export type Tier = "cheap" | "strong";
 export type RouteClass = Tier | "model";
@@ -223,6 +226,85 @@ export const DEFAULT_CONFIG: RouterConfig = {
   },
   quota: DEFAULT_QUOTA_CONFIG,
 };
+
+export interface RouteModelRequest {
+  models: Model<Api>[];
+  hint: string;
+  context?: Context;
+  nowHour?: number;
+  cfg?: RouterConfig;
+  filterQuota?: boolean;
+  agentDir?: string;
+}
+
+export interface RouteModelSelection {
+  key: string;
+}
+
+function mergeRouterConfig(raw: unknown): RouterConfig {
+  if (!raw || typeof raw !== "object") return DEFAULT_CONFIG;
+  const record = raw as Record<string, unknown>;
+  const router = (record.router && typeof record.router === "object" ? record.router : record) as Partial<RouterConfig> & {
+    models?: RouterConfig["tierModels"];
+    overrides?: RouterConfig["modelOverrides"];
+  };
+  const capabilitySource = router.capabilitySource === "aa" ? "aa" : "ramp";
+  const baseWillingness = capabilitySource === "aa" ? AA_WILLINGNESS : RAMP_WILLINGNESS;
+  return {
+    ...DEFAULT_CONFIG,
+    ...router,
+    capabilitySource,
+    weights: { ...DEFAULT_CONFIG.weights, ...(router.weights ?? {}) },
+    tierModels: { ...DEFAULT_CONFIG.tierModels, ...(router.tierModels ?? router.models ?? {}) },
+    modelFilter: { ...DEFAULT_CONFIG.modelFilter, ...(router.modelFilter ?? {}) },
+    modelOverrides: { ...DEFAULT_CONFIG.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
+    willingness: { ...baseWillingness, ...(router.willingness ?? {}) },
+    cacheAware: { ...DEFAULT_CONFIG.cacheAware, ...(router.cacheAware ?? {}) },
+    quota: { ...DEFAULT_CONFIG.quota, ...(router.quota ?? {}) },
+  };
+}
+
+/** Loads only the user-level model-router.json; project configuration requires trust context and is intentionally excluded. */
+export function loadUserRouterConfig(agentDir = defaultAgentDir()): RouterConfig {
+  const file = join(agentDir, "model-router.json");
+  if (!existsSync(file)) return DEFAULT_CONFIG;
+  try {
+    return mergeRouterConfig(JSON.parse(readFileSync(file, "utf8")));
+  } catch {
+    return DEFAULT_CONFIG;
+  }
+}
+
+function defaultAgentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+/** Resolves a routing hint without requiring ExtensionContext or invoking a model provider. */
+export function resolveRouteModel(request: RouteModelRequest): RouteModelSelection | undefined {
+  const hint = request.hint.trim();
+  const normalizedHint = hint.toLowerCase();
+  const concrete = request.models.find((candidate) => modelKey(candidate).toLowerCase() === normalizedHint);
+  if (normalizedHint !== "cheap" && normalizedHint !== "strong" && normalizedHint !== "auto") {
+    if (!concrete || normalizedHint === "pi-router/auto") return undefined;
+    return { key: modelKey(concrete) };
+  }
+
+  const cfg = request.cfg ?? loadUserRouterConfig();
+  const context = request.context ?? { messages: [] };
+  let pool = buildAutoPool(request.models, cfg);
+  if (request.filterQuota !== false && cfg.quota.enabled) {
+    const quota = new QuotaState(cfg.quota);
+    quota.load(join(request.agentDir ?? defaultAgentDir(), "quota-state.json"));
+    pool = filterPoolByQuotaPlanPrefix(pool, quota, Date.now());
+  }
+  pool = repriceForTimeOfDay(pool, request.nowHour ?? new Date().getHours());
+  const forced = normalizedHint === "cheap" || normalizedHint === "strong" ? { tier: normalizedHint } as const : undefined;
+  const decision = decide(context, undefined, forced, cfg);
+  const selection = selectFromPool(decision, pool, context, undefined, cfg);
+  if (!selection) return undefined;
+  const key = modelKey(selection.selected.model);
+  return key.toLowerCase() === "pi-router/auto" ? undefined : { key };
+}
 
 export function normalizeModelKey(key: string): string {
   const withoutProvider = key.toLowerCase().split("/").at(-1) ?? key.toLowerCase();
@@ -565,7 +647,7 @@ function eligibleModels(pool: Pool, context: Context): { eligible: ResolvedModel
 /**
  * Capability Pareto frontier on (quality, list price): keep a model only if no other is at least as
  * capable AND no more expensive (strictly better on one). Dominated models — dumber *and* pricier —
- * are strict waste and never selected. This replaces the old magic-number scoreCandidate.
+ * are strict waste and never selected. This replaces the old hard-coded scoreCandidate.
  */
 export function paretoFrontier(items: ResolvedModel[], profile: ModelProfile): ResolvedModel[] {
   return items.filter((a) => {

@@ -126,6 +126,12 @@ export class QuotaState {
     }));
   }
 
+  /** Returns true when no matching plan is known or at least one matching auth plan is usable. */
+  isAnyAvailableMatching(planKeyPrefix: string, now: number): boolean {
+    const matching = [...this.plans.keys()].filter((planKey) => planKey.startsWith(planKeyPrefix));
+    return matching.length === 0 || matching.some((planKey) => this.isAvailable(planKey, now));
+  }
+
   load(file: string): void {
     if (!existsSync(file)) return;
 
@@ -194,6 +200,29 @@ export function filterPoolByQuota(
   };
 
   return next.all.length === 0 ? pool : next;
+}
+
+/** Filters models when every persisted auth plan for the same provider endpoint is cooling down. */
+export function filterPoolByQuotaPlanPrefix(pool: Pool, quota: QuotaState | undefined, now: number): Pool {
+  if (!quota?.config.enabled) return pool;
+
+  const keep = (item: ResolvedModel) => quota.isAnyAvailableMatching(
+    quotaPlanPrefix(item.model.provider, item.model.baseUrl),
+    now,
+  );
+  const filter = (items: ResolvedModel[]) => items.filter(keep);
+  const next: Pool = {
+    cheapPool: filter(pool.cheapPool),
+    standardPool: filter(pool.standardPool),
+    strongPool: filter(pool.strongPool),
+    unknownPool: filter(pool.unknownPool),
+    all: filter(pool.all),
+  };
+  return next.all.length === 0 ? pool : next;
+}
+
+export function quotaPlanPrefix(provider: string, baseUrl: string): string {
+  return `${provider.trim().toLowerCase()}|${normalizeBaseUrl(baseUrl)}|auth:`;
 }
 
 export function parseRateLimitHeaders(

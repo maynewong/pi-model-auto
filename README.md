@@ -155,9 +155,26 @@ Useful override fields:
 
 Quota state is stored at `~/.pi/agent/quota-state.json`. Providers without remaining-quota headers only cool down after a real `429`.
 
+## Core API
+
+Other Pi extensions can resolve a model without an `ExtensionContext`:
+
+```ts
+import { resolveRouteModel } from "pi-model-auto/core";
+
+const selection = resolveRouteModel({
+  models: availableModels,
+  hint: "cheap", // cheap | strong | auto | provider/model
+  context,
+});
+```
+
+The core API loads user-level `model-router.json` and quota state by default. It never reads project config because that requires a trust decision from the host. Pass `cfg` to supply an explicit configuration or `filterQuota: false` to disable persisted cooldown filtering.
+
 ## Develop
 
 ```bash
+npm run build
 npm run typecheck
 npm test
 ```

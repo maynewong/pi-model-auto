@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { Api, Context, Model, Usage } from "@earendil-works/pi-ai";
 import {
@@ -10,6 +13,8 @@ import {
   normalizeModelKey,
   recordRoutingUsage,
   repriceForTimeOfDay,
+  resolveRouteModel,
+  loadUserRouterConfig,
   timeCostMultiplier,
   resolveCanonicalModel,
   routingTurnKey,
@@ -20,6 +25,7 @@ import {
   type RouterConfig,
   type Selection,
 } from "./router-core.ts";
+import { buildPlanKey, QuotaState } from "./quota.ts";
 
 // The default source is `ramp`; this is the explicit `aa` counterpart for tests that exercise the
 // Artificial Analysis table (the two sources are never merged).
@@ -79,6 +85,79 @@ function toolContinuationContext(text: string): Context {
 }
 
 describe("canonical model routing", () => {
+  it("exports the core contract through the package subpath", async () => {
+    const core = await import("pi-model-auto/core");
+    expect(typeof core.resolveRouteModel).toBe("function");
+    expect(typeof core.loadUserRouterConfig).toBe("function");
+    expect(core.resolveRouteModel({
+      models: [model("gateway", "gpt-5.4-nano")],
+      hint: "gateway/gpt-5.4-nano",
+      cfg: DEFAULT_CONFIG,
+    })).toEqual({ key: "gateway/gpt-5.4-nano" });
+  });
+
+  it("resolves cheap, strong, auto, and concrete core hints", () => {
+    const models = [
+      model("gateway", "gpt-5.4-nano"),
+      model("gateway", "qwen3.7-plus"),
+      model("gateway-codex", "gpt-5.5"),
+    ];
+    expect(resolveRouteModel({ models, hint: "cheap", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
+      .toBe("gateway/qwen3.7-plus");
+    expect(resolveRouteModel({ models, hint: "strong", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
+      .toBe("gateway-codex/gpt-5.5");
+    expect(resolveRouteModel({ models, hint: "auto", context: context("design a complex multi-file architecture"), cfg: DEFAULT_CONFIG })?.key)
+      .not.toBe("pi-router/auto");
+    expect(resolveRouteModel({ models, hint: "gateway/qwen3.7-plus", cfg: DEFAULT_CONFIG }))
+      .toEqual({ key: "gateway/qwen3.7-plus" });
+  });
+
+  it("never returns the router pseudo-model and returns undefined for unavailable models", () => {
+    const models = [model("pi-router", "auto"), model("gateway", "gpt-5.4-nano")];
+    expect(resolveRouteModel({ models, hint: "pi-router/auto", cfg: DEFAULT_CONFIG })).toBeUndefined();
+    expect(resolveRouteModel({ models, hint: "missing/model", cfg: DEFAULT_CONFIG })).toBeUndefined();
+    expect(resolveRouteModel({ models: [model("pi-router", "auto")], hint: "auto", cfg: DEFAULT_CONFIG })).toBeUndefined();
+  });
+
+  it("loads only the user-level router configuration", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-model-auto-config-"));
+    try {
+      writeFileSync(join(root, "model-router.json"), JSON.stringify({
+        router: { capabilitySource: "aa", modelFilter: { include: ["gateway"] }, modelOverrides: { custom: { costCoef: 0.2 } } },
+      }));
+      const cfg = loadUserRouterConfig(root);
+      expect(cfg.capabilitySource).toBe("aa");
+      expect(cfg.modelFilter.include).toEqual(["gateway"]);
+      expect(cfg.modelOverrides.custom?.costCoef).toBe(0.2);
+      expect(cfg.willingness).toEqual(AA_WILLINGNESS);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("filters cooled-down quota plans by default and allows opting out", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-model-auto-quota-"));
+    try {
+      const models = [model("cheap-provider", "qwen3.7-plus"), model("fallback-provider", "gpt-5.4")];
+      const quota = new QuotaState(DEFAULT_CONFIG.quota);
+      const now = Date.now();
+      quota.recordRateLimited(
+        buildPlanKey({ provider: "cheap-provider", baseUrl: "https://example.invalid", apiKey: "test-token" }),
+        60_000,
+        undefined,
+        now,
+      );
+      quota.persist(join(root, "quota-state.json"));
+
+      expect(resolveRouteModel({ models, hint: "cheap", context: context("small task"), cfg: DEFAULT_CONFIG, agentDir: root })?.key)
+        .toBe("fallback-provider/gpt-5.4");
+      expect(resolveRouteModel({ models, hint: "cheap", context: context("small task"), cfg: DEFAULT_CONFIG, agentDir: root, filterQuota: false })?.key)
+        .toBe("cheap-provider/qwen3.7-plus");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("enables quota-aware routing by default without in-turn retry", () => {
     expect(DEFAULT_CONFIG.quota).toMatchObject({
       enabled: true,

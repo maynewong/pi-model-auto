@@ -3,6 +3,13 @@
   "version": "0.1.1",
   "description": "Pi extension package that routes each turn to cheap or strong authenticated models.",
   "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": {
+      "types": "./dist/router-core.d.ts",
+      "import": "./dist/router-core.js"
+    }
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -19,6 +26,7 @@
     "url": "https://github.com/maynewong/pi-model-auto/issues"
   },
   "files": [
+    "dist",
     "src/index.ts",
     "src/router-core.ts",
     "src/quota.ts",
@@ -41,9 +49,11 @@
     "vitest": "4.1.9"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "pretest": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest --run",
-    "prepublishOnly": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "release": "npm version patch && git push --follow-tags && npm publish"
   }
 }

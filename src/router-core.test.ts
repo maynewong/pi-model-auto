@@ -181,13 +181,16 @@ describe("canonical model routing", () => {
   it("uses longest substring matching", () => {
     expect(resolveCanonicalModel("gateway/kimi-k2.7-code-highspeed").canonical?.key).toBe("kimi-k2.7-code-highspeed");
     expect(resolveCanonicalModel("gateway/kimi-k2.7-code").canonical?.key).toBe("kimi-k2.7-code");
+    expect(resolveCanonicalModel("gateway/kimi-k3").canonical?.key).toBe("kimi-k3");
+    expect(resolveCanonicalModel("gateway/deepseek-flash").canonical?.key).toBe("deepseek-v4-flash");
+    expect(resolveCanonicalModel("fireworks_ai/qwen3p7-plus-high").canonical?.key).toBe("qwen3.7-plus");
   });
 
   it("draws capability numbers from the active source, never merged", () => {
     const ramp = resolveCanonicalModel("gateway/kimi-k2.7-code", "ramp");
     expect(ramp.supported).toBe(true);
-    expect(ramp.intelligence).toBe(78.8); // resolve-rate
-    expect(ramp.priceBlended).toBe(0.89); // measured cost per task
+    expect(ramp.intelligence).toBe(79.7); // resolve-rate
+    expect(ramp.priceBlended).toBe(0.88); // measured cost per task
 
     const aa = resolveCanonicalModel("gateway/kimi-k2.7-code", "aa");
     expect(aa.supported).toBe(true);
@@ -196,6 +199,13 @@ describe("canonical model routing", () => {
     // Canonical name known, but Ramp never ran it: unsupported under ramp, supported under aa.
     expect(resolveCanonicalModel("gateway/gemini-3.5-flash", "ramp").supported).toBe(false);
     expect(resolveCanonicalModel("gateway/gemini-3.5-flash", "aa").supported).toBe(true);
+
+    // GPT-5.6 is present in both tables; the active source still decides which numbers route.
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").supported).toBe(true);
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").intelligence).toBe(82.3);
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "aa").supported).toBe(true);
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "aa").intelligence).toBe(58.9);
+    expect(resolveCanonicalModel("gateway/kimi-k3", "aa").supported).toBe(true);
   });
 
   it("does not classify frontier models as cheap when costs are zero (aa)", () => {
@@ -352,7 +362,7 @@ describe("canonical model routing", () => {
     // Real Ramp frontier: nano → qwen3.7 → qwen3.6 → gpt-5.4 → kimi-k2.7-code → gpt-5.5 → fable.
     expect(pick(0)).toBe("qwen3.7-plus");
     expect(pick(1)).toBe("kimi-k2.7-code");
-    expect(pick(2)).toBe("gpt-5.5");
+    expect(pick(2)).toBe("kimi-k2.7-code");
     expect(pick(3)).toBe("claude-fable-5");
   });
 
@@ -379,7 +389,7 @@ describe("canonical model routing", () => {
   });
 
   it("scales the cost axis by the shadow-price coefficient", () => {
-    expect(item(buildAutoPool([model("gateway", "glm-5.2")]), "glm-5.2").priceBlended).toBe(1.88);
+    expect(item(buildAutoPool([model("gateway", "glm-5.2")]), "glm-5.2").priceBlended).toBe(1.89);
 
     const discounted = buildAutoPool([model("gateway", "glm-5.2")], {
       ...DEFAULT_CONFIG,
@@ -389,7 +399,7 @@ describe("canonical model routing", () => {
   });
 
   it("lets a paid subscription win cheap turns it would lose at measured cost", () => {
-    // gpt-5.4 (72.5@$0.66) vs glm-5.2 (80@$1.88): at list cost an easy coder turn takes the cheap gpt-5.4.
+    // gpt-5.4 (73.4@$0.66) vs glm-5.2 (81@$1.89): at list cost an easy coder turn takes the cheap gpt-5.4.
     const models = [model("gateway-codex", "gpt-5.4"), model("gateway", "glm-5.2")];
     const coder = context("implement a typescript helper");
     const pick = (cfg: RouterConfig) =>
@@ -409,11 +419,11 @@ describe("canonical model routing", () => {
     };
     // Build is time-neutral: base coef only, no clock baked in.
     const pool = buildAutoPool([model("gateway", "glm-5.2")], cfg);
-    expect(item(pool, "glm-5.2").priceBlended).toBeCloseTo(1.88 * 0.2);
+    expect(item(pool, "glm-5.2").priceBlended).toBeCloseTo(1.89 * 0.2);
 
     // Per-turn reprice applies the window without rebuilding: 10:00 off-peak, 15:00 inside the 3× window.
-    expect(item(repriceForTimeOfDay(pool, 10), "glm-5.2").priceBlended).toBeCloseTo(1.88 * 0.2);
-    expect(item(repriceForTimeOfDay(pool, 15), "glm-5.2").priceBlended).toBeCloseTo(1.88 * 0.6);
+    expect(item(repriceForTimeOfDay(pool, 10), "glm-5.2").priceBlended).toBeCloseTo(1.89 * 0.2);
+    expect(item(repriceForTimeOfDay(pool, 15), "glm-5.2").priceBlended).toBeCloseTo(1.89 * 0.6);
   });
 
   it("applies time-of-day repricing to forced @cheap tier selection", () => {
@@ -528,7 +538,7 @@ describe("cache-aware stickiness", () => {
     state.lastUsage = usage({ totalTokens: 100_000 });
 
     const result = cacheAwareSelect(freshSelection(item(pool, "gpt-5.5")), state, pool, ctx, DEFAULT_CONFIG);
-    expect(result.cacheReason).toBe("upgrade-quality"); // +22 resolve points
+    expect(result.cacheReason).toBe("upgrade-quality"); // +21.5 resolve points
     expect(result.selection.selected.canonicalKey).toBe("gpt-5.5");
   });
 
@@ -539,7 +549,7 @@ describe("cache-aware stickiness", () => {
     state.lastUsage = usage({ totalTokens: 100_000 });
 
     const result = cacheAwareSelect(freshSelection(item(pool, "kimi-k2.7-code")), state, pool, ctx, DEFAULT_CONFIG);
-    expect(result.cacheReason).toBe("upgrade-not-worth-it"); // only +1.3 points
+    expect(result.cacheReason).toBe("upgrade-not-worth-it"); // only +1.2 points
     expect(result.selection.selected.canonicalKey).toBe("claude-opus-4-8");
   });
 

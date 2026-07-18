@@ -323,8 +323,13 @@ function rampCostTier(costPerTask: number): CostTier {
 export function resolveCanonicalModel(key: string, source: CapabilitySource = "ramp"): CanonicalResolution {
   const normalized = normalizeModelKey(key);
   const canonical = CANONICAL_MODELS
-    .filter((entry) => normalized.includes(entry.key))
-    .sort((a, b) => b.key.length - a.key.length)[0];
+    .map((entry) => {
+      const candidates = [entry.key, ...(entry.aliases ?? [])];
+      const matchLength = Math.max(0, ...candidates.filter((candidate) => normalized.includes(candidate)).map((candidate) => candidate.length));
+      return { entry, matchLength };
+    })
+    .filter((match) => match.matchLength > 0)
+    .sort((a, b) => b.matchLength - a.matchLength || b.entry.key.length - a.entry.key.length)[0]?.entry;
 
   if (!canonical) {
     return {
@@ -370,6 +375,20 @@ export function resolveCanonicalModel(key: string, source: CapabilitySource = "r
       supported: true,
       confidence: "high",
       reason: `Ramp: ${canonical.key} ${ramp.resolveRate}%@$${ramp.costPerTask}`,
+    };
+  }
+
+  if (canonical.source?.startsWith("Ramp SWE-Bench")) {
+    return {
+      canonical,
+      costTier: canonical.costTier,
+      profiles: canonical.profiles,
+      frontier: false,
+      intelligence: FALLBACK_INTELLIGENCE,
+      priceBlended: FALLBACK_PRICE,
+      supported: false,
+      confidence: "low",
+      reason: `no Artificial Analysis result for ${canonical.key}`,
     };
   }
 

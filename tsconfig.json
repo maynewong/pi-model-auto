@@ -3,6 +3,10 @@
     "target": "ES2022",
     "module": "Node16",
     "moduleResolution": "Node16",
+    "baseUrl": ".",
+    "paths": {
+      "pi-model-auto/core": ["./src/router-core.ts"]
+    },
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

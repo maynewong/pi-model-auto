@@ -79,7 +79,25 @@ export default function modelRouter(pi: ExtensionAPI) {
   let lastDecision: LastDecision | undefined;
   let turnSelection: { key: string; selection: Selection } | undefined;
   let routingState: RoutingState = createRoutingState();
-  let providerRegistered = false;
+
+  pi.registerProvider("pi-router", {
+    name: "Pi Router",
+    api: "pi-router-api",
+    baseUrl: "https://router.local",
+    apiKey: "pi-router-dummy-key",
+    models: [
+      {
+        id: "auto",
+        name: "Pi Router (Auto)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_000_000,
+        maxTokens: 64_000,
+      },
+    ],
+    streamSimple,
+  });
 
   pi.registerCommand("auto", {
     description: "Show Pi Model Router pool and last decision",
@@ -96,29 +114,6 @@ export default function modelRouter(pi: ExtensionAPI) {
     pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable(), cfg), cfg, ctx);
     turnSelection = undefined;
     routingState = createRoutingState();
-
-    const api = `pi-router-api:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    if (providerRegistered) pi.unregisterProvider("pi-router");
-    providerRegistered = true;
-
-    pi.registerProvider("pi-router", {
-      name: "Pi Router",
-      api,
-      baseUrl: "https://router.local",
-      apiKey: "pi-router-dummy-key",
-      models: [
-        {
-          id: "auto",
-          name: "Pi Router (Auto)",
-          reasoning: true,
-          input: ["text", "image"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 1_000_000,
-          maxTokens: 64_000,
-        },
-      ],
-      streamSimple,
-    });
 
     updateRouterStatus(ctx, pool.all.length === 0 ? "🧭 no models" : "🧭 ready");
   });

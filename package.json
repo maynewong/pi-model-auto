@@ -1,6 +1,6 @@
 {
   "name": "pi-model-auto",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Pi extension package that routes each turn to cheap or strong authenticated models.",
   "type": "module",
   "exports": {

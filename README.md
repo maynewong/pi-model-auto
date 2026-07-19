@@ -50,8 +50,8 @@ Force one turn when you know what you want:
 @model:anthropic/claude-3-5-sonnet-20241022 use Sonnet here
 ```
 
-- `@cheap` asks for the cheap end of the current pool.
-- `@strong` asks for the strong end.
+- `@cheap` asks for the lower edge of `Low`.
+- `@strong` asks for `Ultra`, falling back to the strongest available lower mode.
 - `@model:provider/model-id` uses that exact model.
 
 The prefix is removed before the model sees your prompt.
@@ -123,7 +123,11 @@ Quality comes from one benchmark table. Cost starts from the same table, then ap
 
 The numeric tables live in [`src/canonical-models.ts`](src/canonical-models.ts). The two sources are not mixed.
 
-Task difficulty is judged from language-neutral signals: context size, prompt length, and recent tool activity. In automatic routing, benchmark-backed effort is selected with the model and passed through to the provider after the model's `thinkingLevelMap` is applied. This avoids treating a `high` UI default as the result for every measured model. When you know a task is harder than it looks, pin with `@strong`.
+With the Ramp source, the status label is an Amp-style capability mode derived only from solve rate: `Ultra` at 85% or above, `High` at 80–85%, `Medium` at 75–80%, and `Low` below 75%. Cost remains a separate routing axis and never determines this label.
+
+Task hardness chooses the mode, while the continuous difficulty score sets a solve-rate floor inside that mode. The router picks the cheapest effective-cost model meeting the floor, then permits only affordable `willingness` upgrades inside the same mode. It never enters the next mode early. If the target mode has no models at all, it borrows the nearest stronger mode; if none exists, it uses the strongest model in the nearest lower mode. Models without capability-mode metadata retain Pareto routing.
+
+Task difficulty is judged from language-neutral signals: context size, prompt length, and recent tool activity. In automatic routing, benchmark-backed effort is selected with the model and takes precedence over Pi's session default before the model's `thinkingLevelMap` is applied. Forced concrete-model routes still honor Pi's selected effort. When you know a task is harder than it looks, pin with `@strong`.
 
 By default, the router also refreshes an LLM classifier in the background. The current turn uses the previous classification result, so time-to-first-token is not blocked. The classifier model is chosen from your authenticated, filtered auto pool by cheapest effective price, unless `classifierModel` pins a specific provider/model. The classifier receives the last user message plus small routing stats; it never uses a provider outside your configured pool.
 
@@ -147,7 +151,7 @@ One user turn keeps one model, including tool-call continuations. Automatic rout
 | `modelFilter` | Include or exclude providers/models by substring. |
 | `models` | Pin the configured `cheap` or `strong` endpoint. |
 | `modelOverrides` | Adjust cost or metadata for known/private/local models. |
-| `willingness` | Control how far each difficulty climbs toward stronger models. |
+| `willingness` | Control affordable same-mode upgrades under Ramp, or frontier climbing under AA. |
 | `cacheAware` | Keep warm prompt caches when switching is not worth it. Enabled by default. |
 | `quota` | Skip cooled-down plans after rate-limit headers or `429`. Enabled by default. |
 | `classifier` | Enable, tune, or disable the background LLM classifier. Use `"off"` to disable. |
@@ -162,7 +166,8 @@ Useful override fields:
 | `costCoef` | Cost multiplier. |
 | `costCoefHours` | Local-hour multipliers. |
 | `canonical` | Name shown in `/auto`. |
-| `costTier` | `cheap`, `standard`, `premium`, or `unknown`. |
+| `costTier` | Cost-only classification: `cheap`, `standard`, `premium`, or `unknown`. |
+| `capabilityMode` | Override the Ramp-style mode: `low`, `medium`, `high`, or `ultra`. |
 | `profiles` | `deep`, `fast`, `coder`, `balanced`, `vision`, `frontier`. |
 | `frontier` | Whether the model can appear in the strong frontier. |
 | `benchmarkEffort` | Pi-normalized effort (`minimal`, `low`, `medium`, `high`, `xhigh`) backing a manual metric row. |

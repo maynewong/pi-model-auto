@@ -17,7 +17,6 @@ import {
   type Context,
   type Model,
   type SimpleStreamOptions,
-  type ThinkingLevel,
 } from "@earendil-works/pi-ai";
 import {
   AA_WILLINGNESS,
@@ -41,6 +40,7 @@ import {
   recordRoutingUsage,
   repriceForTimeOfDay,
   resolveModel,
+  routingReasoning,
   routingTurnKey,
   selectFromPool,
   selectClassifierModel,
@@ -79,6 +79,7 @@ interface LastDecision extends Decision {
   planKey: string;
   canonical: string | null;
   costTier: string;
+  capabilityMode?: string;
   profile?: string;
   benchmarkEffort?: string;
   reasoning?: string;
@@ -221,7 +222,11 @@ export default function modelRouter(pi: ExtensionAPI) {
         if (!auth.ok) throw new Error(auth.error);
         const planKey = quotaPlans.get(modelKey(target))?.planKey ?? modelPlanKey(target, auth);
 
-        const requestedReasoning = routingReasoning(selection, options, decision);
+        const requestedReasoning = routingReasoning(
+          selection.benchmarkEffort,
+          options?.reasoning,
+          decision.cls === "model",
+        );
         const clampedReasoning = target.reasoning ? clampThinkingLevel(target, requestedReasoning) : "off";
         const reasoning = clampedReasoning === "off" ? undefined : clampedReasoning;
         const maxTokens = Math.min(options?.maxTokens ?? target.maxTokens, target.maxTokens);
@@ -232,6 +237,7 @@ export default function modelRouter(pi: ExtensionAPI) {
           planKey,
           canonical: selection.selected.canonicalKey,
           costTier: selection.selected.costTier,
+          capabilityMode: selection.selected.capabilityMode,
           profile: selection.profile,
           benchmarkEffort: selection.benchmarkEffort,
           reasoning: clampedReasoning,
@@ -385,14 +391,6 @@ function selectModel(
   return selection;
 }
 
-function routingReasoning(selection: Selection, options: SimpleStreamOptions | undefined, decision: Decision): ThinkingLevel | "off" {
-  if (decision.cls === "model") return options?.reasoning ?? selection.benchmarkEffort ?? "off";
-  // Pi currently sends the UI default as `high`, which would erase benchmark-backed xhigh/max rows.
-  // Treat default-looking high as unspecified for auto routing; non-high values remain explicit user intent.
-  if (options?.reasoning && options.reasoning !== "high") return options.reasoning;
-  return selection.benchmarkEffort ?? options?.reasoning ?? "off";
-}
-
 function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionContext): Pool {
   const next: Pool = {
     cheapPool: [...pool.cheapPool],
@@ -537,6 +535,7 @@ function describeRouter(
       `  planKey: ${lastDecision.planKey}`,
       `  canonical: ${lastDecision.canonical ?? "unknown"}`,
       `  costTier: ${lastDecision.costTier}`,
+      `  capabilityMode: ${lastDecision.capabilityMode ?? "unknown"}`,
       `  profile: ${lastDecision.profile ?? "unknown"}`,
       `  benchmarkEffort: ${lastDecision.benchmarkEffort ?? "unknown"}`,
       `  reasoning: ${lastDecision.reasoning ?? "off"}`,
@@ -662,7 +661,10 @@ function looksRateLimited(message: AssistantMessage): boolean {
 function shortStatus(decision: LastDecision, quota: QuotaState): string {
   const model = decision.chosen.split("/").at(-1) ?? decision.chosen;
   const effort = decision.reasoning && decision.reasoning !== "off" ? `@${decision.reasoning}` : "";
-  return `🧭 ${model}${effort} · ${decision.costTier}${quotaStatusTag(quota.snapshot(decision.planKey), Date.now())}`;
+  const mode = decision.capabilityMode
+    ? decision.capabilityMode[0].toUpperCase() + decision.capabilityMode.slice(1)
+    : `cost:${decision.costTier}`;
+  return `🧭 ${model}${effort} · ${mode}${quotaStatusTag(quota.snapshot(decision.planKey), Date.now())}`;
 }
 
 function quotaStatusTag(state: PlanState | undefined, now: number): string {

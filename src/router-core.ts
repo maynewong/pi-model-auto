@@ -5,14 +5,33 @@ import type { Api, Context, Model, SimpleStreamOptions, ThinkingLevel, Usage } f
 import { CANONICAL_MODELS, findRampModels, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile, type RampMeta } from "./canonical-models.ts";
 import { DEFAULT_QUOTA_CONFIG, filterPoolByQuotaPlanPrefix, QuotaState, type QuotaConfig } from "./quota.ts";
 
+/**
+ * Keep capability targets, effective cost, and reasoning effort independent: task difficulty sets
+ * the quality floor, economics choose among qualifying variants, and benchmark effort configures the
+ * selected provider call.
+ */
 export type Tier = "cheap" | "strong";
 export type RouteClass = Tier | "model";
 export type Confidence = "high" | "medium" | "low";
 /** Which benchmark drives every model's capability + cost. The two are never merged; selection is wholesale. */
 export type CapabilitySource = "aa" | "ramp";
+export type CapabilityMode = "low" | "medium" | "high" | "ultra";
 /** Task hardness, ordered. Sets how far up the capability frontier selection climbs (the willingness budget). */
 export type Hardness = "trivial" | "normal" | "hard" | "max";
 export const HARDNESS_ORDER: Hardness[] = ["trivial", "normal", "hard", "max"];
+const CAPABILITY_MODE_ORDER: CapabilityMode[] = ["low", "medium", "high", "ultra"];
+const HARDNESS_SCORE_BOUNDS: [number, number][] = [[0, 0.3], [0.3, 0.52], [0.52, 0.74], [0.74, 1]];
+const MODE_SOLVE_BOUNDS: [number, number][] = [[0, 75], [75, 80], [80, 85], [85, 100]];
+
+/** Choose provider reasoning: auto uses its measured model-effort variant; forced models honor Pi. */
+export function routingReasoning(
+  benchmarkEffort: ThinkingLevel | undefined,
+  requestedReasoning: ThinkingLevel | undefined,
+  forcedModel: boolean,
+): ThinkingLevel | "off" {
+  if (forcedModel) return requestedReasoning ?? benchmarkEffort ?? "off";
+  return benchmarkEffort ?? requestedReasoning ?? "off";
+}
 
 /** Fallback capability numbers for models with no canonical match and no override. */
 const FALLBACK_INTELLIGENCE = 25;
@@ -21,6 +40,7 @@ const FALLBACK_PRICE = 3;
 export interface CanonicalResolution {
   canonical: CanonicalMeta | null;
   costTier: CostTier;
+  capabilityMode?: CapabilityMode;
   profiles: ModelProfile[];
   frontier: boolean;
   intelligence: number;
@@ -40,6 +60,7 @@ export interface ResolvedModel {
   acceptsImage: boolean;
   canonicalKey: string | null;
   costTier: CostTier;
+  capabilityMode?: CapabilityMode;
   profiles: ModelProfile[];
   frontier: boolean;
   /** Synthetic intelligence index; capability axis for `balanced`/fallback profiles. */
@@ -70,6 +91,7 @@ export interface Pool {
 export interface ModelOverride {
   canonical?: string;
   costTier?: CostTier;
+  capabilityMode?: CapabilityMode;
   profiles?: ModelProfile[];
   frontier?: boolean;
   intelligence?: number;
@@ -370,6 +392,14 @@ export function normalizeModelKey(key: string): string {
 /** Resolve-rate at/above which a Ramp model is shown as a frontier/strong-pool candidate (display only). */
 const RAMP_FRONTIER_RESOLVE = 75;
 
+/** Map a Ramp solve rate (0–100) to the user-facing capability mode. */
+export function rampCapabilityMode(resolveRate: number): CapabilityMode {
+  if (resolveRate >= MODE_SOLVE_BOUNDS[3][0]) return "ultra";
+  if (resolveRate >= MODE_SOLVE_BOUNDS[2][0]) return "high";
+  if (resolveRate >= MODE_SOLVE_BOUNDS[1][0]) return "medium";
+  return "low";
+}
+
 function rampCostTier(costPerTask: number): CostTier {
   if (costPerTask < 0.4) return "cheap";
   if (costPerTask <= 1.2) return "standard";
@@ -460,6 +490,7 @@ function rampResolution(canonical: CanonicalMeta, ramp: RampMeta): CanonicalReso
   return {
     canonical,
     costTier: rampCostTier(ramp.costPerTask),
+    capabilityMode: rampCapabilityMode(ramp.resolveRate),
     profiles: canonical.profiles,
     frontier: ramp.resolveRate >= RAMP_FRONTIER_RESOLVE,
     intelligence: ramp.resolveRate,
@@ -542,6 +573,7 @@ export function resolveModelVariants(model: Model<Api>, cfg: RouterConfig = DEFA
       acceptsImage: model.input?.includes("image") ?? false,
       canonicalKey: override.canonical ?? resolution.canonical?.key ?? normalizeModelKey(key),
       costTier: override.costTier ?? resolution.costTier,
+      capabilityMode: override.capabilityMode ?? resolution.capabilityMode,
       profiles: override.profiles ?? resolution.profiles,
       frontier: override.frontier ?? resolution.frontier,
       intelligence: override.intelligence ?? resolution.intelligence,
@@ -566,6 +598,7 @@ export function resolveModelVariants(model: Model<Api>, cfg: RouterConfig = DEFA
       acceptsImage: model.input?.includes("image") ?? false,
       canonicalKey: entry.canonical?.key ?? null,
       costTier: entry.costTier,
+      capabilityMode: entry.capabilityMode,
       profiles: entry.profiles,
       frontier: entry.frontier,
       intelligence: entry.intelligence,
@@ -872,6 +905,69 @@ function climbFrontier(chain: ResolvedModel[], profile: ModelProfile, willingnes
   return pick;
 }
 
+function rampModeTarget(decision: Decision): { mode: CapabilityMode; solveRate: number; position: number } {
+  const bucket = Math.max(0, Math.min(CAPABILITY_MODE_ORDER.length - 1, Math.trunc(decision.hardnessBucket)));
+  const [scoreLow, scoreHigh] = HARDNESS_SCORE_BOUNDS[bucket];
+  const score = Number.isFinite(decision.score) ? decision.score : scoreLow;
+  const position = (Math.max(scoreLow, Math.min(scoreHigh, score)) - scoreLow) / (scoreHigh - scoreLow);
+  const [solveLow, solveHigh] = MODE_SOLVE_BOUNDS[bucket];
+  return {
+    mode: CAPABILITY_MODE_ORDER[bucket],
+    solveRate: solveLow + position * (solveHigh - solveLow),
+    position,
+  };
+}
+
+function cheapestMeetingFloor(items: ResolvedModel[], solveRate: number): ResolvedModel | undefined {
+  return [...items]
+    .filter((item) => item.intelligence >= solveRate)
+    .sort((a, b) =>
+      a.priceBlended - b.priceBlended ||
+      b.intelligence - a.intelligence ||
+      modelKey(a.model).localeCompare(modelKey(b.model)),
+    )[0];
+}
+
+function finiteWillingness(cfg: RouterConfig, hardness: Hardness): number {
+  const configured = cfg.willingness[hardness];
+  if (Number.isFinite(configured)) return Math.max(0, configured);
+  return Math.max(0, ...Object.values(cfg.willingness).filter(Number.isFinite));
+}
+
+function climbWithinMode(base: ResolvedModel, items: ResolvedModel[], willingness: number): ResolvedModel {
+  let pick = base;
+  const stronger = items
+    .filter((item) => item.intelligence > base.intelligence)
+    .sort((a, b) => a.intelligence - b.intelligence || a.priceBlended - b.priceBlended);
+  for (const item of stronger) {
+    const qualityGain = item.intelligence - pick.intelligence;
+    const priceIncrease = item.priceBlended - pick.priceBlended;
+    if (qualityGain > 0 && priceIncrease / qualityGain > willingness) break;
+    pick = item;
+  }
+  return pick;
+}
+
+function nearestModeFallback(items: ResolvedModel[], targetMode: CapabilityMode): ResolvedModel | undefined {
+  const targetRank = CAPABILITY_MODE_ORDER.indexOf(targetMode);
+  const ranked = items
+    .map((item) => ({ item, rank: item.capabilityMode ? CAPABILITY_MODE_ORDER.indexOf(item.capabilityMode) : -1 }))
+    .filter(({ rank }) => rank >= 0);
+  const strongerRank = Math.min(...ranked.filter(({ rank }) => rank > targetRank).map(({ rank }) => rank));
+  if (Number.isFinite(strongerRank)) {
+    return ranked
+      .filter(({ rank }) => rank === strongerRank)
+      .map(({ item }) => item)
+      .sort((a, b) => a.priceBlended - b.priceBlended || b.intelligence - a.intelligence)[0];
+  }
+
+  const weakerRank = Math.max(...ranked.filter(({ rank }) => rank < targetRank).map(({ rank }) => rank));
+  return ranked
+    .filter(({ rank }) => rank === weakerRank)
+    .map(({ item }) => item)
+    .sort((a, b) => b.intelligence - a.intelligence || a.priceBlended - b.priceBlended)[0];
+}
+
 export function selectFromPool(
   decision: Decision,
   pool: Pool,
@@ -899,8 +995,33 @@ export function selectFromPool(
     return buildSelection(selected, eligible, profile, `fast: top throughput${overflowNote(overflow)}`);
   }
 
-  // Climb the capability frontier as far as the hardness budget allows.
+  // First remove strictly dominated variants; every later choice stays on this economic frontier.
   const chain = frontierChain(eligible, profile);
+
+  // Ramp maps task difficulty to a solve-rate floor, then spends only on affordable upgrades inside
+  // that Mode. AA has no comparable solve-rate scale and retains the source-specific frontier climb.
+  if (cfg.capabilitySource === "ramp") {
+    const target = rampModeTarget(decision);
+    const sameMode = chain.filter((item) => item.capabilityMode === target.mode);
+    if (sameMode.length > 0) {
+      const base = cheapestMeetingFloor(sameMode, target.solveRate) ?? [...sameMode].sort((a, b) =>
+        b.intelligence - a.intelligence ||
+        a.priceBlended - b.priceBlended ||
+        modelKey(a.model).localeCompare(modelKey(b.model)),
+      )[0];
+      const willingness = finiteWillingness(cfg, hardness) * target.position;
+      const selected = climbWithinMode(base, sameMode, willingness);
+      const reason = `${target.mode} floor≥${target.solveRate.toFixed(1)} w≤$${willingness.toFixed(3)}/pt → ${selected.intelligence.toFixed(1)}@$${selected.priceBlended}${overflowNote(overflow)}`;
+      return buildSelection(selected, chain, profile, reason);
+    }
+
+    const selected = nearestModeFallback(chain, target.mode);
+    if (selected) {
+      const reason = `${target.mode} unavailable → ${selected.capabilityMode} ${selected.intelligence.toFixed(1)}@$${selected.priceBlended}${overflowNote(overflow)}`;
+      return buildSelection(selected, chain, profile, reason);
+    }
+  }
+
   const willingness = cfg.willingness[hardness];
   const selected = climbFrontier(chain, profile, willingness);
 

@@ -20,6 +20,8 @@ import {
   recordClassifierFailure,
   recordClassifierSuccess,
   recordRoutingUsage,
+  rampCapabilityMode,
+  routingReasoning,
   repriceForTimeOfDay,
   resolveRouteModel,
   loadUserRouterConfig,
@@ -115,7 +117,7 @@ describe("canonical model routing", () => {
       model("gateway-codex", "gpt-5.5"),
     ];
     expect(resolveRouteModel({ models, hint: "cheap", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
-      .toBe("gateway/qwen3.7-plus");
+      .toBe("gateway/gpt-5.4-nano");
     expect(resolveRouteModel({ models, hint: "strong", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
       .toBe("gateway-codex/gpt-5.5");
     expect(resolveRouteModel({ models, hint: "auto", context: context("design a complex multi-file architecture"), cfg: DEFAULT_CONFIG })?.key)
@@ -202,6 +204,29 @@ describe("canonical model routing", () => {
 
   it("defaults to the Ramp capability source", () => {
     expect(DEFAULT_CONFIG.capabilitySource).toBe("ramp");
+  });
+
+  it("maps Ramp solve-rate boundaries to Amp-style capability modes", () => {
+    expect(rampCapabilityMode(85)).toBe("ultra");
+    expect(rampCapabilityMode(84.9)).toBe("high");
+    expect(rampCapabilityMode(80)).toBe("high");
+    expect(rampCapabilityMode(79.9)).toBe("medium");
+    expect(rampCapabilityMode(75)).toBe("medium");
+    expect(rampCapabilityMode(74.9)).toBe("low");
+  });
+
+  it("keeps Ramp capability mode independent from cost tier", () => {
+    expect(resolveCanonicalModel("gateway/claude-fable-5", "ramp")).toMatchObject({ capabilityMode: "ultra", costTier: "premium" });
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp")).toMatchObject({ capabilityMode: "high", costTier: "standard" });
+    expect(resolveCanonicalModel("gateway/gpt-5.6-terra", "ramp")).toMatchObject({ capabilityMode: "medium", costTier: "cheap" });
+    expect(resolveCanonicalModel("gateway/gpt-5.4", "ramp")).toMatchObject({ capabilityMode: "low", costTier: "standard" });
+  });
+
+  it("uses benchmark effort for auto routes and UI effort for forced models", () => {
+    expect(routingReasoning("high", "medium", false)).toBe("high");
+    expect(routingReasoning("xhigh", "high", false)).toBe("xhigh");
+    expect(routingReasoning(undefined, "medium", false)).toBe("medium");
+    expect(routingReasoning("high", "medium", true)).toBe("medium");
   });
 
   it("normalizes conservatively", () => {
@@ -459,7 +484,7 @@ describe("canonical model routing", () => {
     expect(pick(3)).toBe("gpt-5.5");
   });
 
-  it("climbs the Ramp frontier by hardness on real resolve-rate (default source)", () => {
+  it("routes Ramp hardness buckets through Low, Medium, High, and Ultra", () => {
     const pool = buildAutoPool([
       model("gateway", "gpt-5.4-nano"),
       model("gateway", "qwen3.7-plus"),
@@ -472,11 +497,124 @@ describe("canonical model routing", () => {
     const coder = context("implement a typescript helper");
     const pick = (bucket: number) => pickAtBucket(pool, coder, DEFAULT_CONFIG, bucket);
 
-    // Real Ramp frontier: nano → qwen3.7 → qwen3.6 → gpt-5.4 → kimi-k2.7-code → gpt-5.5 → fable.
-    expect(pick(0)).toBe("qwen3.7-plus");
+    // The lower edge of each bucket picks the cheapest model meeting that mode's solve-rate floor.
+    expect(pick(0)).toBe("gpt-5.4-nano");
     expect(pick(1)).toBe("kimi-k2.7-code");
-    expect(pick(2)).toBe("kimi-k2.7-code");
+    expect(pick(2)).toBe("gpt-5.5");
     expect(pick(3)).toBe("claude-fable-5");
+  });
+
+  it("selects the cheapest model meeting the continuous floor inside a Ramp mode", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: {
+        "gateway/glm-5.2": { costCoef: 0.35 },
+        "gateway-codex/gpt-5.5": { costCoef: 0.6 },
+      },
+    };
+    const pool = buildAutoPool([
+      model("gateway", "glm-5.2"),
+      model("gateway", "gpt-5.6-sol"),
+      model("gateway-codex", "gpt-5.5"),
+      model("anthropic", "claude-fable-5"),
+    ], cfg);
+    const coder = context("implement a typescript helper");
+    const pick = (score: number) => selectFromPool(
+      { cls: "strong", score, chosen: "", hardnessBucket: 2, requestedProfile: "coder" },
+      pool,
+      coder,
+      undefined,
+      cfg,
+    )?.selected.canonicalKey;
+
+    expect(pick(0.52)).toBe("glm-5.2");
+    expect(pick(0.58)).toBe("gpt-5.6-sol");
+    expect(pick(0.63)).toBe("gpt-5.5");
+  });
+
+  it("allows an affordable willingness upgrade only within the selected Ramp mode", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: {
+        "gateway/glm-5.2": { costCoef: 0.35 },
+        "gateway-codex/gpt-5.5": { costCoef: 0.6 },
+      },
+    };
+    const pool = buildAutoPool([
+      model("gateway", "glm-5.2"),
+      model("gateway", "gpt-5.6-sol"),
+      model("gateway-codex", "gpt-5.5"),
+      model("anthropic", "claude-fable-5"),
+    ], cfg);
+    const coder = context("implement a typescript helper");
+    const selection = selectFromPool(
+      { cls: "strong", score: 0.6, chosen: "", hardnessBucket: 2, requestedProfile: "coder" },
+      pool,
+      coder,
+      undefined,
+      cfg,
+    );
+
+    expect(selection?.selected.canonicalKey).toBe("gpt-5.5");
+    expect(selection?.selected.capabilityMode).toBe("high");
+  });
+
+  it("does not cross into Ultra before the task leaves High", () => {
+    const pool = buildAutoPool([
+      model("gateway", "glm-5.2"),
+      model("anthropic", "claude-fable-5"),
+    ]);
+    const coder = context("implement a typescript helper");
+    const selection = selectFromPool(
+      { cls: "strong", score: 0.73, chosen: "", hardnessBucket: 2, requestedProfile: "coder" },
+      pool,
+      coder,
+      undefined,
+      DEFAULT_CONFIG,
+    );
+
+    expect(selection?.selected.canonicalKey).toBe("glm-5.2");
+  });
+
+  it("borrows the nearest stronger Ramp mode when the target mode is absent", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: { "anthropic/claude-fable-5": { costCoef: 10 } },
+    };
+    const pool = buildAutoPool([
+      model("gateway-codex", "gpt-5.4"),
+      model("anthropic", "claude-fable-5"),
+    ], cfg);
+    const coder = context("implement a typescript helper");
+    const selection = selectFromPool(
+      { cls: "strong", score: 0.6, chosen: "", hardnessBucket: 2, requestedProfile: "coder" },
+      pool,
+      coder,
+      undefined,
+      cfg,
+    );
+
+    expect(selection?.selected.canonicalKey).toBe("claude-fable-5");
+    expect(selection?.reason).toContain("high unavailable");
+  });
+
+  it("falls back to Pareto routing for manual Ramp overrides without a capability mode", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: {
+        "local/private-coder": {
+          intelligence: 70,
+          priceBlended: 0.1,
+          costTier: "cheap",
+          profiles: ["coder"],
+        },
+      },
+    };
+    const pool = buildAutoPool([model("local", "private-coder")], cfg);
+    const coder = context("implement a typescript helper");
+
+    expect(selectFromPool(cheapDecision(coder, cfg), pool, coder, undefined, cfg)?.selected.canonicalKey)
+      .toBe("private-coder");
   });
 
   it("carries benchmark effort through the selected routing variant", () => {
@@ -530,6 +668,33 @@ describe("canonical model routing", () => {
     // Per-turn reprice applies the window without rebuilding: 10:00 off-peak, 15:00 inside the 3× window.
     expect(item(repriceForTimeOfDay(pool, 10), "glm-5.2").priceBlended).toBeCloseTo(1.89 * 0.2);
     expect(item(repriceForTimeOfDay(pool, 15), "glm-5.2").priceBlended).toBeCloseTo(1.89 * 0.6);
+  });
+
+  it("uses time-of-day effective cost inside the selected Ramp mode", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: {
+        "gateway/glm-5.2": { costCoef: 0.35, costCoefHours: [{ hours: [14, 18], factor: 3 }] },
+        "gateway-codex/gpt-5.5": { costCoef: 0.6 },
+      },
+    };
+    const pool = buildAutoPool([
+      model("gateway", "glm-5.2"),
+      model("gateway", "gpt-5.6-sol"),
+      model("gateway-codex", "gpt-5.5"),
+    ], cfg);
+    const coder = context("implement a typescript helper");
+    const decision = { cls: "strong" as const, score: 0.52, chosen: "", hardnessBucket: 2, requestedProfile: "coder" as const };
+    const pick = (atHour: number) => selectFromPool(
+      decision,
+      repriceForTimeOfDay(pool, atHour),
+      coder,
+      undefined,
+      cfg,
+    )?.selected.canonicalKey;
+
+    expect(pick(10)).toBe("glm-5.2");
+    expect(pick(15)).toBe("gpt-5.6-sol");
   });
 
   it("applies time-of-day repricing to forced @cheap tier selection", () => {

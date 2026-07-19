@@ -114,7 +114,7 @@ This means `0.4` normally, `1.2` from 14:00 through 17:59. Windows are half-open
 
 The router compares quality against your effective cost.
 
-Quality comes from one benchmark table. Cost starts from the same table, then applies your `costCoef` and any active time window. The router keeps to the efficient frontier: a model is only worth considering if no other available model is both better and cheaper.
+Quality comes from one benchmark table. Cost starts from the same table, then applies your `costCoef` and any active time window. When the table reports reasoning effort, the router treats `(model, effort)` as the measured operating point. The router keeps to the efficient frontier: a model-effort variant is only worth considering if no other available variant is both better and cheaper.
 
 `capabilitySource` chooses the benchmark:
 
@@ -123,7 +123,19 @@ Quality comes from one benchmark table. Cost starts from the same table, then ap
 
 The numeric tables live in [`src/canonical-models.ts`](src/canonical-models.ts). The two sources are not mixed.
 
-Task difficulty is judged from the request itself — context size, prompt length, keywords, and tool activity — never from your thinking level. Your thinking level (`low`/`medium`/`high`/`xhigh`) controls only how deeply the *chosen* model reasons; it does not change which model is chosen. So leaving thinking on `high` out of habit won't silently push every turn to the most expensive model. When you know a task is harder than it looks, say so in the prompt (or pin with `@strong`).
+Task difficulty is judged from language-neutral signals: context size, prompt length, and recent tool activity. In automatic routing, benchmark-backed effort is selected with the model and passed through to the provider after the model's `thinkingLevelMap` is applied. This avoids treating a `high` UI default as the result for every measured model. When you know a task is harder than it looks, pin with `@strong`.
+
+By default, the router also refreshes an LLM classifier in the background. The current turn uses the previous classification result, so time-to-first-token is not blocked. The classifier model is chosen from your authenticated, filtered auto pool by cheapest effective price, unless `classifierModel` pins a specific provider/model. The classifier receives the last user message plus small routing stats; it never uses a provider outside your configured pool.
+
+Turn it off completely:
+
+```jsonc
+{
+  "router": {
+    "classifier": "off"
+  }
+}
+```
 
 One user turn keeps one model, including tool-call continuations. Automatic routing also avoids quota-cooled plans and avoids switching away from a useful warm cache when the switch is not worth it.
 
@@ -138,7 +150,9 @@ One user turn keeps one model, including tool-call continuations. Automatic rout
 | `willingness` | Control how far each difficulty climbs toward stronger models. |
 | `cacheAware` | Keep warm prompt caches when switching is not worth it. Enabled by default. |
 | `quota` | Skip cooled-down plans after rate-limit headers or `429`. Enabled by default. |
-| `weights` | Difficulty-scoring weights. Advanced. |
+| `classifier` | Enable, tune, or disable the background LLM classifier. Use `"off"` to disable. |
+| `classifierModel` | Pin the classifier to a specific provider/model in your pool. |
+| `weights` | Language-neutral difficulty-scoring weights. Advanced. |
 | `log` | Append routing decisions to `.pi/router.log`. |
 
 Useful override fields:
@@ -151,6 +165,7 @@ Useful override fields:
 | `costTier` | `cheap`, `standard`, `premium`, or `unknown`. |
 | `profiles` | `deep`, `fast`, `coder`, `balanced`, `vision`, `frontier`. |
 | `frontier` | Whether the model can appear in the strong frontier. |
+| `benchmarkEffort` | Pi-normalized effort (`minimal`, `low`, `medium`, `high`, `xhigh`) backing a manual metric row. |
 | `priceBlended`, `intelligence`, `scores`, `tps` | Raw metrics for models without benchmark data. |
 
 Quota state is stored at `~/.pi/agent/quota-state.json`. Providers without remaining-quota headers only cool down after a real `429`.

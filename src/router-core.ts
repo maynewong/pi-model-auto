@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Api, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai";
-import { CANONICAL_MODELS, findRampModel, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile } from "./canonical-models.ts";
+import type { Api, Context, Model, SimpleStreamOptions, ThinkingLevel, Usage } from "@earendil-works/pi-ai";
+import { CANONICAL_MODELS, findRampModels, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile, type RampMeta } from "./canonical-models.ts";
 import { DEFAULT_QUOTA_CONFIG, filterPoolByQuotaPlanPrefix, QuotaState, type QuotaConfig } from "./quota.ts";
 
 export type Tier = "cheap" | "strong";
@@ -27,6 +27,8 @@ export interface CanonicalResolution {
   priceBlended: number;
   scores?: CanonicalScores;
   tps?: number;
+  /** Pi-normalized effort used by the benchmark row backing this resolution, if known. */
+  benchmarkEffort?: ThinkingLevel;
   /** Whether the active capability source has data for this model. Unsupported models are not auto-routed. */
   supported: boolean;
   confidence: Confidence;
@@ -46,6 +48,8 @@ export interface ResolvedModel {
   priceBlended: number;
   scores?: CanonicalScores;
   tps?: number;
+  /** Pi-normalized effort used by the benchmark row backing this routing variant, if known. */
+  benchmarkEffort?: ThinkingLevel;
   /** Whether the active capability source covers this model (or a user override does). Drives auto-pool inclusion. */
   supported: boolean;
   confidence: Confidence;
@@ -72,6 +76,8 @@ export interface ModelOverride {
   priceBlended?: number;
   scores?: CanonicalScores;
   tps?: number;
+  /** Override the benchmark-backed effort metadata for private or manually classified models. */
+  benchmarkEffort?: ThinkingLevel;
   /**
    * Shadow-price coefficient: multiplies the model's base cost-axis price (Ramp cost-per-task under
    * `ramp`). It folds *my* economics into the shared capability frontier without touching the quality
@@ -103,7 +109,6 @@ export interface RouterConfig {
   weights: {
     contextTokens: number;
     lastUserLen: number;
-    keyword: number;
     toolDensity: number;
   };
   log: boolean;
@@ -138,6 +143,16 @@ export interface RouterConfig {
     minTurnsBetweenSwitches: number;
   };
   quota: QuotaConfig;
+  classifier: ClassifierConfig;
+  /** Explicit provider/model or variant ref for the optional LLM classifier. Empty means choose the cheapest eligible pool model. */
+  classifierModel?: string;
+}
+
+export interface ClassifierConfig {
+  enabled: boolean;
+  failureThreshold: number;
+  cooldownTurns: number;
+  timeoutMs: number;
 }
 
 export interface Decision {
@@ -150,9 +165,26 @@ export interface Decision {
   reason?: string;
 }
 
+export interface ClassificationResult {
+  hardness: Hardness;
+  profile?: ModelProfile;
+  score?: number;
+  reason?: string;
+}
+
+export interface TaskClassifier {
+  classify(context: Context, cfg: RouterConfig): ClassificationResult;
+}
+
+export interface ClassifierState {
+  models: Record<string, { failures: number; disabledUntilTurn?: number }>;
+}
+
 export interface Selection {
   selected: ResolvedModel;
   profile: ModelProfile;
+  /** Pi-normalized effort selected with the model when the benchmark source provides one. */
+  benchmarkEffort?: ThinkingLevel;
   reason: string;
   alternatives: string[];
 }
@@ -208,9 +240,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
   threshold: 0.45,
   weights: {
     contextTokens: 0.3,
-    lastUserLen: 0.18,
-    keyword: 0.42,
-    toolDensity: 0.1,
+    lastUserLen: 0.5,
+    toolDensity: 0.2,
   },
   log: false,
   tierModels: {},
@@ -225,6 +256,12 @@ export const DEFAULT_CONFIG: RouterConfig = {
     minTurnsBetweenSwitches: 1,
   },
   quota: DEFAULT_QUOTA_CONFIG,
+  classifier: {
+    enabled: true,
+    failureThreshold: 3,
+    cooldownTurns: 20,
+    timeoutMs: 3_000,
+  },
 };
 
 export interface RouteModelRequest {
@@ -250,6 +287,10 @@ function mergeRouterConfig(raw: unknown): RouterConfig {
   };
   const capabilitySource = router.capabilitySource === "aa" ? "aa" : "ramp";
   const baseWillingness = capabilitySource === "aa" ? AA_WILLINGNESS : RAMP_WILLINGNESS;
+  const classifier = mergeClassifierConfig((router as Record<string, unknown>).classifier);
+  const classifierModel = typeof (router as Record<string, unknown>).classifierModel === "string"
+    ? (router as Record<string, string>).classifierModel
+    : DEFAULT_CONFIG.classifierModel;
   return {
     ...DEFAULT_CONFIG,
     ...router,
@@ -261,7 +302,22 @@ function mergeRouterConfig(raw: unknown): RouterConfig {
     willingness: { ...baseWillingness, ...(router.willingness ?? {}) },
     cacheAware: { ...DEFAULT_CONFIG.cacheAware, ...(router.cacheAware ?? {}) },
     quota: { ...DEFAULT_CONFIG.quota, ...(router.quota ?? {}) },
+    classifier,
+    classifierModel,
   };
+}
+
+export function mergeClassifierConfig(
+  raw: unknown,
+  base: ClassifierConfig = DEFAULT_CONFIG.classifier,
+): ClassifierConfig {
+  if (raw === "off" || raw === false) return { ...base, enabled: false };
+  if (!raw || typeof raw !== "object") return base;
+  return { ...base, ...(raw as Partial<ClassifierConfig>) };
+}
+
+export function inferFallbackProfile(context: Context): ModelProfile {
+  return inferRequestedProfile(context);
 }
 
 /** Loads only the user-level model-router.json; project configuration requires trust context and is intentionally excluded. */
@@ -308,7 +364,7 @@ export function resolveRouteModel(request: RouteModelRequest): RouteModelSelecti
 
 export function normalizeModelKey(key: string): string {
   const withoutProvider = key.toLowerCase().split("/").at(-1) ?? key.toLowerCase();
-  return withoutProvider.trim().replace(/\s*\((?:high|medium|low)\)\s*$/i, "");
+  return withoutProvider.trim().replace(/\s*\((?:xhigh|high|medium|low|minimal|max)\)\s*$/i, "");
 }
 
 /** Resolve-rate at/above which a Ramp model is shown as a frontier/strong-pool candidate (display only). */
@@ -321,6 +377,10 @@ function rampCostTier(costPerTask: number): CostTier {
 }
 
 export function resolveCanonicalModel(key: string, source: CapabilitySource = "ramp"): CanonicalResolution {
+  return resolveCanonicalModels(key, source)[0];
+}
+
+export function resolveCanonicalModels(key: string, source: CapabilitySource = "ramp"): CanonicalResolution[] {
   const normalized = normalizeModelKey(key);
   const canonical = CANONICAL_MODELS
     .map((entry) => {
@@ -332,7 +392,7 @@ export function resolveCanonicalModel(key: string, source: CapabilitySource = "r
     .sort((a, b) => b.matchLength - a.matchLength || b.entry.key.length - a.entry.key.length)[0]?.entry;
 
   if (!canonical) {
-    return {
+    return [{
       canonical: null,
       costTier: "unknown",
       profiles: ["balanced"],
@@ -342,14 +402,14 @@ export function resolveCanonicalModel(key: string, source: CapabilitySource = "r
       supported: false,
       confidence: "low",
       reason: "no canonical match",
-    };
+    }];
   }
 
   if (source === "ramp") {
-    const ramp = findRampModel(canonical.key);
-    if (!ramp) {
+    const variants = findRampModels(canonical.key);
+    if (variants.length === 0) {
       // Canonical name is known, but Ramp never measured it — unsupported for auto-routing under `ramp`.
-      return {
+      return [{
         canonical,
         costTier: canonical.costTier,
         profiles: canonical.profiles,
@@ -359,27 +419,13 @@ export function resolveCanonicalModel(key: string, source: CapabilitySource = "r
         supported: false,
         confidence: "low",
         reason: `no Ramp result for ${canonical.key}`,
-      };
+      }];
     }
-    // One real outcome (resolve-rate) is the axis for every profile; mirror it into the per-profile scores.
-    const scores: CanonicalScores = { coding: ramp.resolveRate, agentic: ramp.resolveRate / 100 };
-    return {
-      canonical,
-      costTier: rampCostTier(ramp.costPerTask),
-      profiles: canonical.profiles,
-      frontier: ramp.resolveRate >= RAMP_FRONTIER_RESOLVE,
-      intelligence: ramp.resolveRate,
-      priceBlended: ramp.costPerTask,
-      scores,
-      tps: undefined,
-      supported: true,
-      confidence: "high",
-      reason: `Ramp: ${canonical.key} ${ramp.resolveRate}%@$${ramp.costPerTask}`,
-    };
+    return variants.map((ramp) => rampResolution(canonical, ramp));
   }
 
   if (canonical.source?.startsWith("Ramp SWE-Bench")) {
-    return {
+    return [{
       canonical,
       costTier: canonical.costTier,
       profiles: canonical.profiles,
@@ -389,10 +435,10 @@ export function resolveCanonicalModel(key: string, source: CapabilitySource = "r
       supported: false,
       confidence: "low",
       reason: `no Artificial Analysis result for ${canonical.key}`,
-    };
+    }];
   }
 
-  return {
+  return [{
     canonical,
     costTier: canonical.costTier,
     profiles: canonical.profiles,
@@ -401,9 +447,29 @@ export function resolveCanonicalModel(key: string, source: CapabilitySource = "r
     priceBlended: canonical.priceBlended,
     scores: canonical.scores,
     tps: canonical.tps,
+    benchmarkEffort: canonical.benchmarkEffort,
     supported: true,
     confidence: "high",
-    reason: `canonical match: ${canonical.key}`,
+    reason: `canonical match: ${canonical.key}${canonical.benchmarkEffort ? `@${canonical.benchmarkEffort}` : ""}`,
+  }];
+}
+
+function rampResolution(canonical: CanonicalMeta, ramp: RampMeta): CanonicalResolution {
+  // One real outcome (resolve-rate) is the axis for every profile; mirror it into the per-profile scores.
+  const scores: CanonicalScores = { coding: ramp.resolveRate, agentic: ramp.resolveRate / 100 };
+  return {
+    canonical,
+    costTier: rampCostTier(ramp.costPerTask),
+    profiles: canonical.profiles,
+    frontier: ramp.resolveRate >= RAMP_FRONTIER_RESOLVE,
+    intelligence: ramp.resolveRate,
+    priceBlended: ramp.costPerTask,
+    scores,
+    tps: undefined,
+    benchmarkEffort: ramp.effort,
+    supported: true,
+    confidence: "high",
+    reason: `Ramp: ${canonical.key}@${ramp.effort} ${ramp.resolveRate}%@$${ramp.costPerTask}`,
   };
 }
 
@@ -415,7 +481,7 @@ export function buildAutoPool(models: Model<Api>[], cfg: RouterConfig = DEFAULT_
   const all = models
     .filter((model) => model.provider !== "pi-router")
     .filter((model) => model.input?.includes("text"))
-    .map((model) => resolveModel(model, cfg))
+    .flatMap((model) => resolveModelVariants(model, cfg))
     // A model the active source has no data for (and no override) is not auto-routed.
     .filter((model) => model.supported)
     .filter((model) => matchesModelFilter(model, cfg.modelFilter))
@@ -430,9 +496,38 @@ export function buildAutoPool(models: Model<Api>[], cfg: RouterConfig = DEFAULT_
   };
 }
 
+export function selectClassifierModel(
+  pool: Pool,
+  cfg: RouterConfig,
+  state: ClassifierState,
+  turn: number,
+): ResolvedModel | undefined {
+  if (!cfg.classifier.enabled) return undefined;
+
+  const candidates = pool.all.filter((item) => !isClassifierModelDisabled(state, modelKey(item.model), turn));
+  if (cfg.classifierModel) {
+    const ref = cfg.classifierModel.toLowerCase();
+    return candidates.find((item) =>
+      modelKey(item.model).toLowerCase() === ref ||
+      variantKey(item).toLowerCase() === ref ||
+      item.canonicalKey?.toLowerCase() === ref
+    );
+  }
+
+  return [...candidates].sort((a, b) =>
+    a.priceBlended - b.priceBlended ||
+    modelKey(a.model).localeCompare(modelKey(b.model)),
+  )[0];
+}
+
 export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONFIG): ResolvedModel {
+  return resolveModelVariants(model, cfg)[0];
+}
+
+export function resolveModelVariants(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONFIG): ResolvedModel[] {
   const key = modelKey(model);
-  const resolution = resolveCanonicalModel(key, cfg.capabilitySource);
+  const resolutions = resolveCanonicalModels(key, cfg.capabilitySource);
+  const resolution = resolutions[0];
   const override = findModelOverride(cfg, key, resolution.canonical?.key ?? null);
   // The base shadow-price coefficient folds the caller's real economics into the shared frontier: it
   // scales whatever base cost the source/override resolved, staying dimensionless so the axis keeps one
@@ -442,7 +537,7 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
 
   if (override) {
     const base = override.priceBlended ?? blendedPriceFromCost(model) ?? resolution.priceBlended;
-    return {
+    return [{
       model,
       acceptsImage: model.input?.includes("image") ?? false,
       canonicalKey: override.canonical ?? resolution.canonical?.key ?? normalizeModelKey(key),
@@ -453,6 +548,7 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
       priceBlended: base * coef,
       scores: override.scores ?? resolution.scores,
       tps: override.tps ?? resolution.tps,
+      benchmarkEffort: override.benchmarkEffort ?? resolution.benchmarkEffort,
       // An explicit override always makes the model routable, even when the active source lacks data.
       supported: true,
       confidence: resolution.canonical ? "medium" : "high",
@@ -460,25 +556,28 @@ export function resolveModel(model: Model<Api>, cfg: RouterConfig = DEFAULT_CONF
         ? `user override + ${resolution.reason}`
         : "user override for unknown model",
       costCoefHours: override.costCoefHours,
-    };
+    }];
   }
 
-  const base = resolution.supported ? resolution.priceBlended : (blendedPriceFromCost(model) ?? resolution.priceBlended);
-  return {
-    model,
-    acceptsImage: model.input?.includes("image") ?? false,
-    canonicalKey: resolution.canonical?.key ?? null,
-    costTier: resolution.costTier,
-    profiles: resolution.profiles,
-    frontier: resolution.frontier,
-    intelligence: resolution.intelligence,
-    priceBlended: base * coef,
-    scores: resolution.scores,
-    tps: resolution.tps,
-    supported: resolution.supported,
-    confidence: resolution.confidence,
-    matchReason: resolution.reason,
-  };
+  return resolutions.map((entry) => {
+    const base = entry.supported ? entry.priceBlended : (blendedPriceFromCost(model) ?? entry.priceBlended);
+    return {
+      model,
+      acceptsImage: model.input?.includes("image") ?? false,
+      canonicalKey: entry.canonical?.key ?? null,
+      costTier: entry.costTier,
+      profiles: entry.profiles,
+      frontier: entry.frontier,
+      intelligence: entry.intelligence,
+      priceBlended: base * coef,
+      scores: entry.scores,
+      tps: entry.tps,
+      benchmarkEffort: entry.benchmarkEffort,
+      supported: entry.supported,
+      confidence: entry.confidence,
+      matchReason: entry.reason,
+    };
+  });
 }
 
 /** Product of the time-of-day window factors active at `nowHour` (1 when none apply). */
@@ -573,6 +672,7 @@ export function decide(
   options: SimpleStreamOptions | undefined,
   forced: { tier: Tier } | { model: string } | undefined,
   cfg: RouterConfig,
+  classifier: TaskClassifier = HEURISTIC_CLASSIFIER,
 ): Decision {
   if (forced && "model" in forced) return { cls: "model", score: 1, chosen: forced.model, hardnessBucket: 3, reason: "forced model" };
   if (forced && "tier" in forced) {
@@ -582,19 +682,22 @@ export function decide(
       chosen: "",
       // @cheap means "cheapest acceptable"; @strong means "the strong end".
       hardnessBucket: forced.tier === "strong" ? 3 : 0,
-      requestedProfile: inferRequestedProfile(context),
+      requestedProfile: inferFallbackProfile(context),
       reason: "forced",
     };
   }
 
-  const score = classify(context, cfg);
-  const hardnessBucket = autoHardnessBucket(score);
+  const classification = classifier.classify(context, cfg);
+  const requestedProfile = classification.profile ?? inferFallbackProfile(context);
+  const hardnessBucket = hardnessBucketIndex(classification.hardness);
+  const score = classification.score ?? representativeHardnessScore(classification.hardness);
   return {
     cls: hardnessBucket >= 2 ? "strong" : "cheap",
     score,
     chosen: "",
     hardnessBucket,
-    requestedProfile: inferRequestedProfile(context),
+    requestedProfile,
+    reason: classification.reason,
   };
 }
 
@@ -609,32 +712,85 @@ export function autoHardnessBucket(score: number): number {
 }
 
 export function classify(context: Context, cfg: RouterConfig): number {
-  const text = lastUserText(context).toLowerCase();
+  const text = lastUserText(context);
   const contextTokens = estimateContextTokens(context);
   const toolDensity = Math.min(1, countRecentToolResults(context) / 8);
 
   const raw =
     normalize(contextTokens, 8_000, 120_000) * cfg.weights.contextTokens +
     normalize(text.length, 120, 1_200) * cfg.weights.lastUserLen +
-    keywordScore(text) * cfg.weights.keyword +
     toolDensity * cfg.weights.toolDensity;
 
   return Math.max(0, Math.min(1, raw));
 }
 
+export const HEURISTIC_CLASSIFIER: TaskClassifier = {
+  classify(context, cfg) {
+    const score = classify(context, cfg);
+    const hardness = HARDNESS_ORDER[autoHardnessBucket(score)];
+    return { hardness, score, profile: inferRequestedProfile(context), reason: "heuristic" };
+  },
+};
+
+export function parseClassificationOutput(text: string): ClassificationResult | undefined {
+  const lower = text.toLowerCase();
+  const hardness = matchEnum(lower, ["trivial", "normal", "hard", "max"]);
+  if (!hardness) return undefined;
+
+  const profile = matchEnum(lower, ["deep", "fast", "coder", "balanced", "vision"]);
+  const score = parseScore(lower);
+  return {
+    hardness,
+    profile,
+    score,
+    reason: "llm-classifier",
+  };
+}
+
+function matchEnum<const T extends string>(text: string, values: readonly T[]): T | undefined {
+  const alternation = values.join("|");
+  const keyed = text.match(new RegExp(`\\b(?:hardness|difficulty|level|profile|task_profile)\\s*[:=]\\s*(${alternation})\\b`));
+  const loose = keyed ?? text.match(new RegExp(`\\b(${alternation})\\b`));
+  return loose?.[1] as T | undefined;
+}
+
+function parseScore(text: string): number | undefined {
+  const match = text.match(/\bscore\s*[:=]\s*(0(?:\.\d+)?|1(?:\.0+)?)\b/);
+  if (!match) return undefined;
+  return Math.max(0, Math.min(1, Number(match[1])));
+}
+
+export function createClassifierState(): ClassifierState {
+  return { models: {} };
+}
+
+export function isClassifierModelDisabled(state: ClassifierState, key: string, turn: number): boolean {
+  const disabledUntil = state.models[key]?.disabledUntilTurn;
+  return disabledUntil != null && disabledUntil > turn;
+}
+
+export function recordClassifierSuccess(state: ClassifierState, key: string): void {
+  state.models[key] = { failures: 0 };
+}
+
+export function recordClassifierFailure(state: ClassifierState, key: string, turn: number, cfg: RouterConfig): void {
+  const previous = state.models[key] ?? { failures: 0 };
+  const failures = previous.failures + 1;
+  state.models[key] = failures >= cfg.classifier.failureThreshold
+    ? { failures: 0, disabledUntilTurn: turn + cfg.classifier.cooldownTurns }
+    : { ...previous, failures };
+}
+
+function hardnessBucketIndex(hardness: Hardness): number {
+  return HARDNESS_ORDER.indexOf(hardness);
+}
+
+function representativeHardnessScore(hardness: Hardness): number {
+  return [0.15, 0.4, 0.63, 0.86][hardnessBucketIndex(hardness)] ?? 0.4;
+}
+
 export function inferRequestedProfile(context: Context): ModelProfile {
   if (contextHasImage(context)) return "vision";
-
-  const text = lastUserText(context).toLowerCase();
-  if (/\b(root cause|debug|architecture|design|plan|race condition|concurrency)\b/.test(text)) {
-    return "deep";
-  }
-  if (/\b(fast|quick|high frequency|low latency|speed)\b/.test(text)) {
-    return "fast";
-  }
-  if (/\b(code|coding|refactor|multi-file|implement|test|typescript|elixir|ruby|go)\b/.test(text)) {
-    return "coder";
-  }
   return "balanced";
 }
 
@@ -693,7 +849,12 @@ export function frontierChain(items: ResolvedModel[], profile: ModelProfile): Re
   const chain: ResolvedModel[] = [];
   for (const item of sorted) {
     const prev = chain.at(-1);
-    if (prev && axisValue(prev, profile) === axisValue(item, profile) && prev.priceBlended === item.priceBlended) continue;
+    if (
+      prev &&
+      axisValue(prev, profile) === axisValue(item, profile) &&
+      prev.priceBlended === item.priceBlended &&
+      variantKey(prev) === variantKey(item)
+    ) continue;
     chain.push(item);
   }
   return chain;
@@ -718,7 +879,7 @@ export function selectFromPool(
   options: SimpleStreamOptions | undefined,
   cfg: RouterConfig,
 ): Selection | undefined {
-  const profile = inferRequestedProfile(context);
+  const profile = decision.requestedProfile ?? inferRequestedProfile(context);
   const { eligible, overflow } = eligibleModels(pool, context);
   if (eligible.length === 0) return undefined;
 
@@ -757,8 +918,9 @@ function buildSelection(
   return {
     selected,
     profile,
+    benchmarkEffort: selected.benchmarkEffort,
     reason,
-    alternatives: frontier.filter((item) => item !== selected).map((item) => modelKey(item.model)),
+    alternatives: frontier.filter((item) => item !== selected).map(variantKey),
   };
 }
 
@@ -850,12 +1012,13 @@ export function cacheAwareSelect(
 }
 
 function leaseSelection(leaseItem: ResolvedModel, fresh: Selection, profile: ModelProfile): Selection {
-  const leaseKey = modelKey(leaseItem.model);
+  const leaseKey = variantKey(leaseItem);
   return {
     selected: leaseItem,
     profile,
+    benchmarkEffort: leaseItem.benchmarkEffort,
     reason: "warm cache lease",
-    alternatives: [modelKey(fresh.selected.model), ...fresh.alternatives.filter((key) => key !== leaseKey)],
+    alternatives: [variantKey(fresh.selected), ...fresh.alternatives.filter((key) => key !== leaseKey)],
   };
 }
 
@@ -972,19 +1135,15 @@ function resolveCostRank(tier: CostTier): number {
 }
 
 function compareResolvedModels(a: ResolvedModel, b: ResolvedModel): number {
-  return resolveCostRank(a.costTier) - resolveCostRank(b.costTier) || modelKey(a.model).localeCompare(modelKey(b.model));
+  return resolveCostRank(a.costTier) - resolveCostRank(b.costTier) || variantKey(a).localeCompare(variantKey(b));
+}
+
+export function variantKey(item: ResolvedModel): string {
+  return item.benchmarkEffort ? `${modelKey(item.model)}@${item.benchmarkEffort}` : modelKey(item.model);
 }
 
 function countRecentToolResults(context: Context): number {
   return context.messages.slice(-12).filter((message) => message.role === "toolResult").length;
-}
-
-function keywordScore(text: string): number {
-  const cheap = /\b(format|lint|typo|rename|docs?|readme|translate|summari[sz]e|grep|search)\b/.test(text);
-  const strong = /\b(architecture|design|debug|root cause|race condition|refactor|multi-file|security|performance|concurrency|plan)\b/.test(text);
-  if (strong) return 1;
-  if (cheap) return 0;
-  return 0.45;
 }
 
 function normalize(value: number, low: number, high: number): number {

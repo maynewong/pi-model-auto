@@ -8,22 +8,34 @@ import {
   DEFAULT_CONFIG,
   buildAutoPool,
   cacheAwareSelect,
+  classify,
+  createClassifierState,
   createRoutingState,
   decide,
+  inferRequestedProfile,
+  isClassifierModelDisabled,
+  mergeClassifierConfig,
   normalizeModelKey,
+  parseClassificationOutput,
+  recordClassifierFailure,
+  recordClassifierSuccess,
   recordRoutingUsage,
   repriceForTimeOfDay,
   resolveRouteModel,
   loadUserRouterConfig,
+  selectClassifierModel,
   timeCostMultiplier,
   resolveCanonicalModel,
+  resolveModelVariants,
   routingTurnKey,
   selectFromPool,
   shouldReuseTurnSelection,
   userTurnIndex,
+  variantKey,
   type ResolvedModel,
   type RouterConfig,
   type Selection,
+  type TaskClassifier,
 } from "./router-core.ts";
 import { buildPlanKey, QuotaState } from "./quota.ts";
 
@@ -123,16 +135,36 @@ describe("canonical model routing", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-model-auto-config-"));
     try {
       writeFileSync(join(root, "model-router.json"), JSON.stringify({
-        router: { capabilitySource: "aa", modelFilter: { include: ["gateway"] }, modelOverrides: { custom: { costCoef: 0.2 } } },
+        router: {
+          capabilitySource: "aa",
+          modelFilter: { include: ["gateway"] },
+          modelOverrides: { custom: { costCoef: 0.2 } },
+          classifier: "off",
+          classifierModel: "gateway/gpt-5.6-luna",
+        },
       }));
       const cfg = loadUserRouterConfig(root);
       expect(cfg.capabilitySource).toBe("aa");
       expect(cfg.modelFilter.include).toEqual(["gateway"]);
       expect(cfg.modelOverrides.custom?.costCoef).toBe(0.2);
       expect(cfg.willingness).toEqual(AA_WILLINGNESS);
+      expect(cfg.classifier.enabled).toBe(false);
+      expect(cfg.classifierModel).toBe("gateway/gpt-5.6-luna");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("merges partial classifier config without disabling it", () => {
+    expect(mergeClassifierConfig({ timeoutMs: 10_000 })).toMatchObject({
+      enabled: true,
+      timeoutMs: 10_000,
+      failureThreshold: DEFAULT_CONFIG.classifier.failureThreshold,
+    });
+    expect(mergeClassifierConfig({ timeoutMs: 10_000 }, { ...DEFAULT_CONFIG.classifier, enabled: false })).toMatchObject({
+      enabled: false,
+      timeoutMs: 10_000,
+    });
   });
 
   it("filters cooled-down quota plans by default and allows opting out", () => {
@@ -175,6 +207,8 @@ describe("canonical model routing", () => {
   it("normalizes conservatively", () => {
     expect(normalizeModelKey("gateway/Kimi-K2.7-Code-Highspeed(high)")).toBe("kimi-k2.7-code-highspeed");
     expect(normalizeModelKey("vibeproxy/gpt-5.5(medium)")).toBe("gpt-5.5");
+    expect(normalizeModelKey("anthropic/claude-fable-5(xhigh)")).toBe("claude-fable-5");
+    expect(normalizeModelKey("openai/gpt-5.6-sol(max)")).toBe("gpt-5.6-sol");
     expect(normalizeModelKey("gateway/deepseek-v4-flash")).toBe("deepseek-v4-flash");
   });
 
@@ -203,9 +237,16 @@ describe("canonical model routing", () => {
     // GPT-5.6 is present in both tables; the active source still decides which numbers route.
     expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").supported).toBe(true);
     expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").intelligence).toBe(82.3);
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").benchmarkEffort).toBe("xhigh");
     expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "aa").supported).toBe(true);
     expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "aa").intelligence).toBe(58.9);
     expect(resolveCanonicalModel("gateway/kimi-k3", "aa").supported).toBe(true);
+  });
+
+  it("represents benchmark results as model-effort routing variants", () => {
+    const variants = resolveModelVariants(model("anthropic", "claude-fable-5"), DEFAULT_CONFIG);
+    expect(variants.map(variantKey)).toEqual(["anthropic/claude-fable-5@xhigh"]);
+    expect(variants[0].matchReason).toContain("claude-fable-5@xhigh");
   });
 
   it("does not classify frontier models as cheap when costs are zero (aa)", () => {
@@ -298,14 +339,87 @@ describe("canonical model routing", () => {
       AA,
     );
 
-    // @strong = unlimited willingness → top of frontier on each axis.
-    const deep = context("debug root cause and plan architecture");
-    expect(selectFromPool(strongDecision(deep, AA), pool, deep, undefined, AA)?.selected.canonicalKey).toBe("gpt-5.5");
-    const coder = context("general coding task");
-    expect(selectFromPool(strongDecision(coder, AA), pool, coder, undefined, AA)?.selected.canonicalKey).toBe("gpt-5.5");
-    // fast: highest throughput regardless of tier.
-    const fast = context("need a fast coding response");
-    expect(selectFromPool(strongDecision(fast, AA), pool, fast, undefined, AA)?.selected.canonicalKey).toBe("kimi-k2.7-code-highspeed");
+    // @strong = unlimited willingness → top of the language-neutral fallback frontier.
+    const request = context("general task");
+    expect(selectFromPool(strongDecision(request, AA), pool, request, undefined, AA)?.selected.canonicalKey).toBe("gpt-5.5");
+  });
+
+  it("keeps deterministic fallback classification language-neutral", () => {
+    const englishKeywords = "debug root cause architecture";
+    const neutralSameLength = "plain neutral request".padEnd(englishKeywords.length, "x");
+
+    expect(classify(context(englishKeywords), DEFAULT_CONFIG)).toBe(classify(context(neutralSameLength), DEFAULT_CONFIG));
+    expect(inferRequestedProfile(context(englishKeywords))).toBe("balanced");
+  });
+
+  it("lets tests inject a classifier result for hardness and profile", () => {
+    const pool = buildAutoPool(
+      [
+        model("gateway-codex", "gpt-5.5"),
+        model("gateway", "glm-5.2"),
+        model("gateway", "kimi-k2.7-code-highspeed"),
+      ],
+      AA,
+    );
+    const fakeClassifier: TaskClassifier = {
+      classify: () => ({ hardness: "max", profile: "fast", reason: "fake classifier" }),
+    };
+    const request = context("同样的请求文本");
+    const decision = decide(request, undefined, undefined, AA, fakeClassifier);
+
+    expect(decision.hardnessBucket).toBe(3);
+    expect(decision.score).toBe(0.86);
+    expect(decision.requestedProfile).toBe("fast");
+    expect(selectFromPool(decision, pool, request, undefined, AA)?.selected.canonicalKey).toBe("kimi-k2.7-code-highspeed");
+  });
+
+  it("does not let stale classifier profiles affect forced tiers", () => {
+    const pool = buildAutoPool(
+      [
+        model("gateway-codex", "gpt-5.5"),
+        model("gateway", "glm-5.2"),
+        model("gateway", "kimi-k2.7-code-highspeed"),
+      ],
+      AA,
+    );
+    const staleClassifier: TaskClassifier = {
+      classify: () => ({ hardness: "max", profile: "fast", reason: "stale classifier" }),
+    };
+    const request = context("@strong should ignore stale fast profile");
+    const decision = decide(request, undefined, { tier: "strong" }, AA, staleClassifier);
+
+    expect(decision.requestedProfile).toBe("balanced");
+    expect(selectFromPool(decision, pool, request, undefined, AA)?.selected.canonicalKey).toBe("gpt-5.5");
+  });
+
+  it("parses noisy classifier output and falls back when hardness is missing", () => {
+    expect(parseClassificationOutput("Sure.\nprofile: coder\nhardness = hard\nscore: 0.72")).toMatchObject({
+      hardness: "hard",
+      profile: "coder",
+      score: 0.72,
+    });
+    expect(parseClassificationOutput("profile: coder only")).toBeUndefined();
+  });
+
+  it("selects the cheapest available classifier model and honors cooldown", () => {
+    const pool = buildAutoPool([
+      model("gateway", "gpt-5.6-luna"),
+      model("gateway", "gpt-5.6-sol"),
+      model("gateway", "kimi-k3"),
+    ], AA);
+    const state = createClassifierState();
+
+    expect(selectClassifierModel(pool, AA, state, 1)?.canonicalKey).toBe("gpt-5.6-luna");
+
+    const explicit: RouterConfig = { ...AA, classifierModel: "gateway/kimi-k3" };
+    expect(selectClassifierModel(pool, explicit, state, 1)?.canonicalKey).toBe("kimi-k3");
+
+    recordClassifierFailure(state, "gateway/gpt-5.6-luna", 1, { ...AA, classifier: { ...AA.classifier, failureThreshold: 1 } });
+    expect(isClassifierModelDisabled(state, "gateway/gpt-5.6-luna", 2)).toBe(true);
+    expect(selectClassifierModel(pool, AA, state, 2)?.canonicalKey).toBe("kimi-k3");
+
+    recordClassifierSuccess(state, "gateway/gpt-5.6-luna");
+    expect(isClassifierModelDisabled(state, "gateway/gpt-5.6-luna", 3)).toBe(false);
   });
 
   // Hardness drives the climb directly (content-derived in production); reasoning level never does.
@@ -323,7 +437,7 @@ describe("canonical model routing", () => {
       cfg,
     )?.selected.canonicalKey;
 
-  it("climbs the frontier by hardness so the whole spread is reachable (aa)", () => {
+  it("climbs the language-neutral frontier by hardness (aa)", () => {
     const pool = buildAutoPool(
       [
         model("gateway", "deepseek-v4-flash"),
@@ -338,10 +452,9 @@ describe("canonical model routing", () => {
     const coder = context("implement a typescript helper");
     const pick = (bucket: number) => pickAtBucket(pool, coder, AA, bucket);
 
-    // trivial → cheap end; normal → mid value point (pro→kimi step too steep to climb past);
-    // hard → glm; max → top of frontier.
-    expect(pick(0)).toBe("deepseek-v4-flash");
-    expect(pick(1)).toBe("deepseek-v4-pro");
+    // On the balanced fallback axis, flash is dominated and normal climbs to the mid frontier point.
+    expect(pick(0)).toBe("deepseek-v4-pro");
+    expect(pick(1)).toBe("glm-5.2");
     expect(pick(2)).toBe("glm-5.2");
     expect(pick(3)).toBe("gpt-5.5");
   });
@@ -366,26 +479,19 @@ describe("canonical model routing", () => {
     expect(pick(3)).toBe("claude-fable-5");
   });
 
-  it("ignores thinking level when selecting a model (reasoning is passthrough only)", () => {
+  it("carries benchmark effort through the selected routing variant", () => {
     const pool = buildAutoPool([
       model("gateway", "qwen3.7-plus"),
       model("gateway-codex", "gpt-5.4"),
       model("gateway", "glm-5.2"),
-      model("gateway-codex", "gpt-5.5"),
+      model("anthropic", "claude-fable-5"),
     ]);
     const coder = context("implement a typescript helper");
-    const pick = (reasoning?: "medium" | "high" | "xhigh") => {
-      const opts = reasoning ? { reasoning } : undefined;
-      return selectFromPool(decide(coder, opts, undefined, DEFAULT_CONFIG), pool, coder, opts, DEFAULT_CONFIG)
-        ?.selected.canonicalKey;
-    };
+    const selection = selectFromPool(strongDecision(coder), pool, coder, { reasoning: "high" }, DEFAULT_CONFIG);
 
-    // Same content + same pool ⇒ same model, regardless of how deep the chosen model is told to think.
-    const base = pick(undefined);
-    expect(base).toBeDefined();
-    expect(pick("medium")).toBe(base);
-    expect(pick("high")).toBe(base);
-    expect(pick("xhigh")).toBe(base);
+    expect(selection?.selected.canonicalKey).toBe("claude-fable-5");
+    expect(selection?.benchmarkEffort).toBe("xhigh");
+    expect(selection?.alternatives).toContain("gateway/glm-5.2@high");
   });
 
   it("scales the cost axis by the shadow-price coefficient", () => {

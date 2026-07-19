@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   clampThinkingLevel,
+  completeSimple,
   createAssistantMessageEventStream,
   streamSimple as aiStreamSimple,
   type Api,
@@ -16,6 +17,7 @@ import {
   type Context,
   type Model,
   type SimpleStreamOptions,
+  type ThinkingLevel,
 } from "@earendil-works/pi-ai";
 import {
   AA_WILLINGNESS,
@@ -24,24 +26,37 @@ import {
   axisValue,
   buildAutoPool,
   cacheAwareSelect,
+  createClassifierState,
   createRoutingState,
   decide,
+  estimateContextTokens,
   frontierChain,
+  lastUserText,
   matchesModelFilter,
+  mergeClassifierConfig,
   modelKey,
+  parseClassificationOutput,
+  recordClassifierFailure,
+  recordClassifierSuccess,
   recordRoutingUsage,
   repriceForTimeOfDay,
   resolveModel,
   routingTurnKey,
   selectFromPool,
+  selectClassifierModel,
   shouldReuseTurnSelection,
+  userTurnIndex,
+  variantKey,
   type CacheReason,
+  type ClassificationResult,
+  type ClassifierState,
   type Decision,
   type Pool,
   type ResolvedModel,
   type RouterConfig,
   type RoutingState,
   type Selection,
+  type TaskClassifier,
   type Tier,
 } from "./router-core.ts";
 import { QuotaState, buildPlanKey, filterPoolByQuota, type PlanState } from "./quota.ts";
@@ -65,6 +80,8 @@ interface LastDecision extends Decision {
   canonical: string | null;
   costTier: string;
   profile?: string;
+  benchmarkEffort?: string;
+  reasoning?: string;
   confidence: string;
   alternatives: string[];
   cacheReason?: CacheReason;
@@ -79,6 +96,9 @@ export default function modelRouter(pi: ExtensionAPI) {
   let lastDecision: LastDecision | undefined;
   let turnSelection: { key: string; selection: Selection } | undefined;
   let routingState: RoutingState = createRoutingState();
+  let classifierState: ClassifierState = createClassifierState();
+  let lastClassification: ClassificationResult | undefined;
+  let classifierRefreshSeq = 0;
 
   pi.registerProvider("pi-router", {
     name: "Pi Router",
@@ -114,6 +134,9 @@ export default function modelRouter(pi: ExtensionAPI) {
     pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable(), cfg), cfg, ctx);
     turnSelection = undefined;
     routingState = createRoutingState();
+    classifierState = createClassifierState();
+    lastClassification = undefined;
+    classifierRefreshSeq = 0;
 
     updateRouterStatus(ctx, pool.all.length === 0 ? "🧭 no models" : "🧭 ready");
   });
@@ -130,6 +153,7 @@ export default function modelRouter(pi: ExtensionAPI) {
     forcedRoute = undefined;
     lastDecision = undefined;
     turnSelection = undefined;
+    lastClassification = undefined;
     extCtx = undefined;
   });
 
@@ -154,7 +178,11 @@ export default function modelRouter(pi: ExtensionAPI) {
           throw new Error("Pi Router: no authenticated models. Run /login or configure an API key, then /reload.");
         }
 
-        const decision = decide(context, options, forcedRoute, cfg);
+        const cachedClassifier: TaskClassifier | undefined = lastClassification
+          ? { classify: () => lastClassification! }
+          : undefined;
+        const decision = decide(context, options, forcedRoute, cfg, cachedClassifier);
+        if (!forcedRoute && !shouldReuseTurnSelection(context)) scheduleClassifierRefresh(ctx, context);
         const quotaPlans = cfg.quota.enabled && !forcedRoute ? await resolveQuotaPlans(ctx, pool) : new Map();
         const turnKey = routingTurnKey(context);
         const cachedSelection = turnSelection;
@@ -193,7 +221,7 @@ export default function modelRouter(pi: ExtensionAPI) {
         if (!auth.ok) throw new Error(auth.error);
         const planKey = quotaPlans.get(modelKey(target))?.planKey ?? modelPlanKey(target, auth);
 
-        const requestedReasoning = options?.reasoning ?? "off";
+        const requestedReasoning = routingReasoning(selection, options, decision);
         const clampedReasoning = target.reasoning ? clampThinkingLevel(target, requestedReasoning) : "off";
         const reasoning = clampedReasoning === "off" ? undefined : clampedReasoning;
         const maxTokens = Math.min(options?.maxTokens ?? target.maxTokens, target.maxTokens);
@@ -205,6 +233,8 @@ export default function modelRouter(pi: ExtensionAPI) {
           canonical: selection.selected.canonicalKey,
           costTier: selection.selected.costTier,
           profile: selection.profile,
+          benchmarkEffort: selection.benchmarkEffort,
+          reasoning: clampedReasoning,
           confidence: selection.selected.confidence,
           reason: selection.reason,
           alternatives: selection.alternatives,
@@ -258,6 +288,81 @@ export default function modelRouter(pi: ExtensionAPI) {
 
     return stream;
   }
+
+  function scheduleClassifierRefresh(ctx: ExtensionContext, context: Context): void {
+    if (!cfg.classifier.enabled) return;
+
+    const turn = userTurnIndex(context);
+    const candidate = selectClassifierModel(repriceForTimeOfDay(pool, new Date().getHours()), cfg, classifierState, turn);
+    if (!candidate) return;
+
+    const seq = ++classifierRefreshSeq;
+    const key = modelKey(candidate.model);
+    void (async () => {
+      try {
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(candidate.model);
+        if (!auth.ok) {
+          recordClassifierFailure(classifierState, key, turn, cfg);
+          return;
+        }
+
+        const message = await completeSimple(candidate.model, classifierContext(context), {
+          apiKey: auth.apiKey,
+          headers: auth.headers,
+          env: auth.env,
+          reasoning: candidate.model.reasoning ? "minimal" : undefined,
+          maxTokens: 80,
+          temperature: 0,
+          timeoutMs: cfg.classifier.timeoutMs,
+          maxRetries: 0,
+        });
+        const parsed = parseClassificationOutput(assistantText(message));
+        if (!parsed) {
+          recordClassifierFailure(classifierState, key, turn, cfg);
+          return;
+        }
+
+        if (seq === classifierRefreshSeq) lastClassification = parsed;
+        recordClassifierSuccess(classifierState, key);
+      } catch {
+        recordClassifierFailure(classifierState, key, turn, cfg);
+      }
+    })();
+  }
+}
+
+function classifierContext(context: Context): Context {
+  return {
+    systemPrompt: [
+      "Classify the user's request for model routing.",
+      "Return only: hardness=<trivial|normal|hard|max> profile=<balanced|coder|deep|fast|vision> score=<0..1>.",
+      "Use hard/max for multi-step debugging, architecture, security, or long-horizon coding.",
+      "Use fast only when speed is the user's primary goal.",
+    ].join("\n"),
+    messages: [{
+      role: "user",
+      content: [
+        `estimatedContextTokens=${estimateContextTokens(context)}`,
+        `hasImage=${contextHasImageForClassifier(context)}`,
+        "lastUserMessage:",
+        lastUserText(context),
+      ].join("\n"),
+      timestamp: Date.now(),
+    }],
+  };
+}
+
+function assistantText(message: AssistantMessage): string {
+  return message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function contextHasImageForClassifier(context: Context): boolean {
+  return context.messages.some(
+    (message) => Array.isArray(message.content) && message.content.some((part) => part.type === "image"),
+  );
 }
 
 function selectModel(
@@ -272,12 +377,20 @@ function selectModel(
     const model = findModelByRef(ctx, decision.chosen);
     if (!model) throw new Error(`Pi Router: forced model not available or not authenticated: ${decision.chosen}`);
     const selected = resolveModel(model, cfg);
-    return { selected, profile: selected.profiles[0] ?? "balanced", reason: "forced model", alternatives: [] };
+    return { selected, profile: selected.profiles[0] ?? "balanced", benchmarkEffort: selected.benchmarkEffort, reason: "forced model", alternatives: [] };
   }
 
   const selection = selectFromPool(decision, pool, context, options, cfg);
   if (!selection) throw new Error("Pi Router: model pool is empty");
   return selection;
+}
+
+function routingReasoning(selection: Selection, options: SimpleStreamOptions | undefined, decision: Decision): ThinkingLevel | "off" {
+  if (decision.cls === "model") return options?.reasoning ?? selection.benchmarkEffort ?? "off";
+  // Pi currently sends the UI default as `high`, which would erase benchmark-backed xhigh/max rows.
+  // Treat default-looking high as unspecified for auto routing; non-high values remain explicit user intent.
+  if (options?.reasoning && options.reasoning !== "high") return options.reasoning;
+  return selection.benchmarkEffort ?? options?.reasoning ?? "off";
 }
 
 function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionContext): Pool {
@@ -366,6 +479,7 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
         cacheAware: { ...cfg.cacheAware, ...(router.cacheAware ?? {}) },
         quota: { ...cfg.quota, ...(router.quota ?? {}) },
+        classifier: mergeClassifierConfig(router.classifier, cfg.classifier),
       };
       if (router.willingness) userWillingness = { ...userWillingness, ...router.willingness };
     } catch (error) {
@@ -410,7 +524,7 @@ function describeRouter(
     ...(["coder", "deep", "balanced"] as const).map((profile) => {
       const chain = frontierChain(pool.all, profile);
       const points = chain
-        .map((item) => `${item.canonicalKey ?? modelKey(item.model)}(${axisValue(item, profile).toFixed(0)}@$${item.priceBlended})`)
+        .map((item) => `${displayVariantName(item)}(${axisValue(item, profile).toFixed(0)}@$${item.priceBlended})`)
         .join(" → ");
       return `  ${profile}: ${points || "none"}`;
     }),
@@ -424,6 +538,8 @@ function describeRouter(
       `  canonical: ${lastDecision.canonical ?? "unknown"}`,
       `  costTier: ${lastDecision.costTier}`,
       `  profile: ${lastDecision.profile ?? "unknown"}`,
+      `  benchmarkEffort: ${lastDecision.benchmarkEffort ?? "unknown"}`,
+      `  reasoning: ${lastDecision.reasoning ?? "off"}`,
       `  confidence: ${lastDecision.confidence}`,
       `  cacheReason: ${lastDecision.cacheReason ?? "n/a"}`,
       `  reason: ${lastDecision.reason ?? "none"}`,
@@ -444,6 +560,11 @@ function describeRouter(
   }
 
   return lines.join("\n");
+}
+
+function displayVariantName(item: ResolvedModel): string {
+  if (!item.canonicalKey) return variantKey(item);
+  return item.benchmarkEffort ? `${item.canonicalKey}@${item.benchmarkEffort}` : item.canonicalKey;
 }
 
 function logDecision(ctx: ExtensionContext, cfg: RouterConfig, decision: LastDecision | undefined) {
@@ -540,7 +661,8 @@ function looksRateLimited(message: AssistantMessage): boolean {
 
 function shortStatus(decision: LastDecision, quota: QuotaState): string {
   const model = decision.chosen.split("/").at(-1) ?? decision.chosen;
-  return `🧭 ${model} · ${decision.costTier}${quotaStatusTag(quota.snapshot(decision.planKey), Date.now())}`;
+  const effort = decision.reasoning && decision.reasoning !== "off" ? `@${decision.reasoning}` : "";
+  return `🧭 ${model}${effort} · ${decision.costTier}${quotaStatusTag(quota.snapshot(decision.planKey), Date.now())}`;
 }
 
 function quotaStatusTag(state: PlanState | undefined, now: number): string {

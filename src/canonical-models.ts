@@ -1,3 +1,5 @@
+import type { ThinkingLevel } from "@earendil-works/pi-ai";
+
 export type CostTier = "cheap" | "standard" | "premium" | "unknown";
 export type ModelProfile = "deep" | "fast" | "coder" | "balanced" | "vision" | "frontier";
 
@@ -28,6 +30,8 @@ export interface CanonicalMeta {
   scores?: CanonicalScores;
   /** Output tokens/sec. Axis for the `fast` profile. */
   tps?: number;
+  /** Pi-normalized effort used for the benchmark row, when the source reports one. */
+  benchmarkEffort?: ThinkingLevel;
   costTier: CostTier;
   profiles: ModelProfile[];
   frontier: boolean;
@@ -52,9 +56,9 @@ const RAMP = "Ramp SWE-Bench (mini-swe-agent), 2026-07";
  */
 export const CANONICAL_MODELS: CanonicalMeta[] = [
   // OpenAI
-  { key: "gpt-5.6-sol", intelligence: 58.9, priceBlended: 11.25, scores: { coding: 77.4, agentic: 0.540 }, tps: 55, costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA_API },
-  { key: "gpt-5.6-terra", intelligence: 55.0, priceBlended: 5.625, scores: { coding: 76.7, agentic: 0.474 }, tps: 136, costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA_API },
-  { key: "gpt-5.6-luna", intelligence: 51.2, priceBlended: 2.25, scores: { coding: 71.4, agentic: 0.456 }, tps: 186, costTier: "premium", profiles: ["deep", "coder", "balanced"], frontier: false, source: AA_API },
+  { key: "gpt-5.6-sol", intelligence: 58.9, priceBlended: 11.25, scores: { coding: 77.4, agentic: 0.540 }, tps: 55, benchmarkEffort: "xhigh", costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA_API },
+  { key: "gpt-5.6-terra", intelligence: 55.0, priceBlended: 5.625, scores: { coding: 76.7, agentic: 0.474 }, tps: 136, benchmarkEffort: "xhigh", costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA_API },
+  { key: "gpt-5.6-luna", intelligence: 51.2, priceBlended: 2.25, scores: { coding: 71.4, agentic: 0.456 }, tps: 186, benchmarkEffort: "xhigh", costTier: "premium", profiles: ["deep", "coder", "balanced"], frontier: false, source: AA_API },
   { key: "gpt-5.5", intelligence: 53.1, priceBlended: 11.25, scores: { coding: 71.6, agentic: 0.794, ifbench: 0.716 }, tps: 83, costTier: "premium", profiles: ["coder", "balanced", "frontier"], frontier: true, source: AA },
   { key: "gpt-5.4", intelligence: 51.4, priceBlended: 5.625, scores: { coding: 71.1, agentic: 0.783, ifbench: 0.739 }, tps: 168, costTier: "premium", profiles: ["coder", "balanced", "frontier"], frontier: true, source: AA },
   { key: "gpt-5.4-mini", intelligence: 40.0, priceBlended: 1.688, scores: { coding: 56.1, agentic: 0.592, ifbench: 0.733 }, tps: 202, costTier: "standard", profiles: ["coder", "balanced"], frontier: false, source: AA },
@@ -63,15 +67,15 @@ export const CANONICAL_MODELS: CanonicalMeta[] = [
   { key: "gpt-4.1", intelligence: 15.2, priceBlended: 1.52, scores: { coding: 15.2, agentic: 0.152 }, costTier: "premium", profiles: ["balanced"], frontier: false, source: RAMP },
   { key: "gpt-oss-120b", intelligence: 23.8, priceBlended: 0.262, scores: { coding: 30.4, agentic: 0.262, ifbench: 0.690 }, tps: 347, costTier: "cheap", profiles: ["balanced"], frontier: false, source: AA },
   // Anthropic
-  { key: "claude-fable-5", intelligence: 59.9, priceBlended: 20, scores: { coding: 76.5, agentic: 0.846, ifbench: 0.635 }, tps: 70, costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA },
-  { key: "claude-opus-4-8", intelligence: 55.7, priceBlended: 10, scores: { coding: 74.3, agentic: 0.846, ifbench: 0.622 }, tps: 70, costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA },
-  { key: "claude-opus-4-7", intelligence: 53.5, priceBlended: 10, scores: { coding: 73.6, agentic: 0.831, ifbench: 0.586 }, tps: 58, costTier: "premium", profiles: ["deep", "coder", "balanced"], frontier: false, source: AA },
+  { key: "claude-fable-5", intelligence: 59.9, priceBlended: 20, scores: { coding: 76.5, agentic: 0.846, ifbench: 0.635 }, tps: 70, benchmarkEffort: "xhigh", costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA },
+  { key: "claude-opus-4-8", intelligence: 55.7, priceBlended: 10, scores: { coding: 74.3, agentic: 0.846, ifbench: 0.622 }, tps: 70, benchmarkEffort: "xhigh", costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA },
+  { key: "claude-opus-4-7", intelligence: 53.5, priceBlended: 10, scores: { coding: 73.6, agentic: 0.831, ifbench: 0.586 }, tps: 58, benchmarkEffort: "xhigh", costTier: "premium", profiles: ["deep", "coder", "balanced"], frontier: false, source: AA },
   { key: "claude-opus-4-6", intelligence: 79.7, priceBlended: 1.47, scores: { coding: 79.7, agentic: 0.797 }, costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: RAMP },
   { key: "claude-sonnet-5", intelligence: 74.7, priceBlended: 1.22, scores: { coding: 74.7, agentic: 0.747 }, costTier: "premium", profiles: ["coder", "balanced"], frontier: false, source: RAMP },
   { key: "claude-sonnet-4-6", intelligence: 47.2, priceBlended: 6, scores: { coding: 63.0, agentic: 0.712, ifbench: 0.566 }, tps: 69, costTier: "premium", profiles: ["coder", "balanced"], frontier: false, source: AA },
   { key: "claude-4-5-haiku", aliases: ["claude-haiku-4-5"], intelligence: 29.6, priceBlended: 2, scores: { coding: 43.9, agentic: 0.442, ifbench: 0.543 }, tps: 173, costTier: "standard", profiles: ["fast", "balanced"], frontier: false, source: AA },
   // Google
-  { key: "gemini-3.5-flash", intelligence: 50.2, priceBlended: 3.375, scores: { coding: 70.1, agentic: 0.787, ifbench: 0.763 }, tps: 247, costTier: "premium", profiles: ["coder", "balanced", "frontier"], frontier: true, source: AA },
+  { key: "gemini-3.5-flash", intelligence: 50.2, priceBlended: 3.375, scores: { coding: 70.1, agentic: 0.787, ifbench: 0.763 }, tps: 247, benchmarkEffort: "high", costTier: "premium", profiles: ["coder", "balanced", "frontier"], frontier: true, source: AA },
   { key: "gemini-3.1-pro", aliases: ["gemini-3.1-pro-preview"], intelligence: 46.5, priceBlended: 4.5, scores: { coding: 68.8, agentic: 0.738, ifbench: 0.771 }, tps: 152, costTier: "premium", profiles: ["deep", "balanced", "frontier"], frontier: true, source: AA },
   { key: "gemini-3.1-flash-lite", intelligence: 25.0, priceBlended: 0.563, scores: { coding: 34.7, agentic: 0.311, ifbench: 0.772 }, tps: 355, costTier: "cheap", profiles: ["fast", "balanced"], frontier: false, source: AA },
   // DeepSeek
@@ -85,7 +89,7 @@ export const CANONICAL_MODELS: CanonicalMeta[] = [
   { key: "qwen3.7-plus", aliases: ["qwen3p7-plus"], intelligence: 39.0, priceBlended: 0.59, scores: { coding: 55.9, agentic: 0.610, ifbench: 0.780 }, tps: 51, costTier: "standard", profiles: ["coder", "balanced"], frontier: false, source: AA },
   { key: "qwen3.6-plus", aliases: ["qwen3p6-plus"], intelligence: 39.6, priceBlended: 1.125, scores: { coding: 54.5, agentic: 0.614, ifbench: 0.752 }, tps: 52, costTier: "standard", profiles: ["coder", "balanced"], frontier: false, source: AA },
   // Z AI GLM
-  { key: "glm-5.2", aliases: ["glm-5p2"], intelligence: 51.1, priceBlended: 2.15, scores: { coding: 68.8, agentic: 0.779, ifbench: 0.733 }, tps: 104, costTier: "premium", profiles: ["deep", "balanced"], frontier: true, source: AA },
+  { key: "glm-5.2", aliases: ["glm-5p2"], intelligence: 51.1, priceBlended: 2.15, scores: { coding: 68.8, agentic: 0.779, ifbench: 0.733 }, tps: 104, benchmarkEffort: "xhigh", costTier: "premium", profiles: ["deep", "balanced"], frontier: true, source: AA },
   { key: "glm-5.1", aliases: ["glm-5p1"], intelligence: 40.2, priceBlended: 2.15, scores: { coding: 55.8, agentic: 0.618, ifbench: 0.763 }, tps: 105, costTier: "standard", profiles: ["deep", "balanced"], frontier: false, source: AA },
   // Kimi (Moonshot)
   { key: "kimi-k3", intelligence: 57.1, priceBlended: 6, scores: { coding: 76.2, agentic: 0.501 }, tps: 62, costTier: "premium", profiles: ["deep", "coder", "balanced", "frontier"], frontier: true, source: AA_API },
@@ -105,19 +109,23 @@ export const CANONICAL_MODELS: CanonicalMeta[] = [
 ];
 
 /**
- * Per-model results from the Ramp SWE-Bench run (mini-swe-agent harness, 80 tasks): real agentic
+ * Per-model/effort results from the Ramp SWE-Bench run (mini-swe-agent harness, 80 tasks): real agentic
  * resolve-rate and measured per-task cost (API list pricing, prompt-cache included). This is a
  * SEPARATE source from the Artificial Analysis numbers above — the router consumes one or the other
  * (`capabilitySource`), never a merge: mixing real outcomes and synthetic scores on one scale is
- * meaningless. Keyed by canonical model key. A model absent here has no Ramp result and is therefore
- * not auto-routed when `capabilitySource` is `ramp` (reach it via `modelOverrides` or a forced route).
+ * meaningless. Keyed by canonical model key plus Pi-normalized effort. A model absent here has no Ramp
+ * result and is therefore not auto-routed when `capabilitySource` is `ramp` (reach it via
+ * `modelOverrides` or a forced route).
  *
- * Caveat: a single harness/run, reasoning fixed at high/xhigh, billed at API list (no subscription),
- * no vision and no throughput metric. It is a real-task coding slice, not a universal capability score.
+ * Caveat: the current table has one published effort row per model, billed at API list (no
+ * subscription), no vision and no throughput metric. It is a real-task coding slice, not a universal
+ * capability score.
  */
 export interface RampMeta {
   /** Canonical model key; matches a `CanonicalMeta.key` above. */
   key: string;
+  /** Pi-normalized effort used for this measured run. Provider values like `max` map through model metadata. */
+  effort: ThinkingLevel;
   /** SWE-bench resolve rate, 0–100. The capability axis for every profile under the `ramp` source. */
   resolveRate: number;
   /** Mean measured cost per task, USD (API list pricing). The Pareto cost axis under `ramp`. */
@@ -128,34 +136,43 @@ export interface RampMeta {
 }
 
 export const RAMP_MODELS: RampMeta[] = [
-  { key: "claude-fable-5", resolveRate: 87.3, costPerTask: 2.68, turns: 49, source: RAMP },
-  { key: "gpt-5.5", resolveRate: 83.5, costPerTask: 1.82, turns: 52, source: RAMP },
-  { key: "claude-opus-4-7", resolveRate: 83.5, costPerTask: 2.25, turns: 71, source: RAMP },
-  { key: "gpt-5.6-sol", resolveRate: 82.3, costPerTask: 1.01, turns: 44, source: RAMP },
-  { key: "grok-4.5", resolveRate: 81, costPerTask: 1.14, turns: 54, source: RAMP },
-  { key: "glm-5.2", resolveRate: 81, costPerTask: 1.89, turns: 98, source: RAMP },
-  { key: "kimi-k2.7-code", resolveRate: 79.7, costPerTask: 0.88, turns: 77, source: RAMP },
-  { key: "claude-opus-4-6", resolveRate: 79.7, costPerTask: 1.47, turns: 58, source: RAMP },
-  { key: "claude-opus-4-8", resolveRate: 78.5, costPerTask: 1.08, turns: 39, source: RAMP },
-  { key: "gpt-5.6-terra", resolveRate: 75.9, costPerTask: 0.33, turns: 29, source: RAMP },
-  { key: "gemini-3.1-pro", resolveRate: 74.7, costPerTask: 1.03, turns: 55, source: RAMP },
-  { key: "claude-sonnet-5", resolveRate: 74.7, costPerTask: 1.22, turns: 49, source: RAMP },
-  { key: "gpt-5.6-luna", resolveRate: 73.4, costPerTask: 0.22, turns: 37, source: RAMP },
-  { key: "gpt-5.4", resolveRate: 73.4, costPerTask: 0.66, turns: 28, source: RAMP },
-  { key: "kimi-k2.6", resolveRate: 73.4, costPerTask: 0.69, turns: 81, source: RAMP },
-  { key: "claude-sonnet-4-6", resolveRate: 72.2, costPerTask: 0.79, turns: 50, source: RAMP },
-  { key: "glm-5.1", resolveRate: 70.9, costPerTask: 1.08, turns: 77, source: RAMP },
-  { key: "qwen3.6-plus", resolveRate: 65.8, costPerTask: 0.29, turns: 107, source: RAMP },
-  { key: "deepseek-v4-pro", resolveRate: 65.8, costPerTask: 0.8, turns: 55, source: RAMP },
-  { key: "qwen3.7-plus", resolveRate: 62, costPerTask: 0.15, turns: 53, source: RAMP },
-  { key: "gpt-5.4-mini", resolveRate: 59.5, costPerTask: 0.23, turns: 29, source: RAMP },
-  { key: "gpt-5.4-nano", resolveRate: 49.4, costPerTask: 0.09, turns: 54, source: RAMP },
-  { key: "claude-4-5-haiku", resolveRate: 49.4, costPerTask: 0.49, turns: 72, source: RAMP },
-  { key: "gpt-4.1", resolveRate: 15.2, costPerTask: 1.52, turns: 95, source: RAMP },
+  { key: "claude-fable-5", effort: "xhigh", resolveRate: 87.3, costPerTask: 2.68, turns: 49, source: RAMP },
+  { key: "gpt-5.5", effort: "high", resolveRate: 83.5, costPerTask: 1.82, turns: 52, source: RAMP },
+  { key: "claude-opus-4-7", effort: "xhigh", resolveRate: 83.5, costPerTask: 2.25, turns: 71, source: RAMP },
+  { key: "gpt-5.6-sol", effort: "xhigh", resolveRate: 82.3, costPerTask: 1.01, turns: 44, source: RAMP },
+  { key: "grok-4.5", effort: "high", resolveRate: 81, costPerTask: 1.14, turns: 54, source: RAMP },
+  { key: "glm-5.2", effort: "high", resolveRate: 81, costPerTask: 1.89, turns: 98, source: RAMP },
+  { key: "kimi-k2.7-code", effort: "high", resolveRate: 79.7, costPerTask: 0.88, turns: 77, source: RAMP },
+  { key: "claude-opus-4-6", effort: "xhigh", resolveRate: 79.7, costPerTask: 1.47, turns: 58, source: RAMP },
+  { key: "claude-opus-4-8", effort: "xhigh", resolveRate: 78.5, costPerTask: 1.08, turns: 39, source: RAMP },
+  { key: "gpt-5.6-terra", effort: "xhigh", resolveRate: 75.9, costPerTask: 0.33, turns: 29, source: RAMP },
+  { key: "gemini-3.1-pro", effort: "high", resolveRate: 74.7, costPerTask: 1.03, turns: 55, source: RAMP },
+  { key: "claude-sonnet-5", effort: "xhigh", resolveRate: 74.7, costPerTask: 1.22, turns: 49, source: RAMP },
+  { key: "gpt-5.6-luna", effort: "xhigh", resolveRate: 73.4, costPerTask: 0.22, turns: 37, source: RAMP },
+  { key: "gpt-5.4", effort: "high", resolveRate: 73.4, costPerTask: 0.66, turns: 28, source: RAMP },
+  { key: "kimi-k2.6", effort: "high", resolveRate: 73.4, costPerTask: 0.69, turns: 81, source: RAMP },
+  { key: "claude-sonnet-4-6", effort: "high", resolveRate: 72.2, costPerTask: 0.79, turns: 50, source: RAMP },
+  { key: "glm-5.1", effort: "high", resolveRate: 70.9, costPerTask: 1.08, turns: 77, source: RAMP },
+  { key: "qwen3.6-plus", effort: "high", resolveRate: 65.8, costPerTask: 0.29, turns: 107, source: RAMP },
+  { key: "deepseek-v4-pro", effort: "high", resolveRate: 65.8, costPerTask: 0.8, turns: 55, source: RAMP },
+  { key: "qwen3.7-plus", effort: "high", resolveRate: 62, costPerTask: 0.15, turns: 53, source: RAMP },
+  { key: "gpt-5.4-mini", effort: "high", resolveRate: 59.5, costPerTask: 0.23, turns: 29, source: RAMP },
+  { key: "gpt-5.4-nano", effort: "high", resolveRate: 49.4, costPerTask: 0.09, turns: 54, source: RAMP },
+  { key: "claude-4-5-haiku", effort: "high", resolveRate: 49.4, costPerTask: 0.49, turns: 72, source: RAMP },
+  { key: "gpt-4.1", effort: "high", resolveRate: 15.2, costPerTask: 1.52, turns: 95, source: RAMP },
 ];
 
-const RAMP_BY_KEY = new Map(RAMP_MODELS.map((entry) => [entry.key, entry]));
+const RAMP_BY_KEY = new Map<string, RampMeta[]>();
+for (const entry of RAMP_MODELS) {
+  const variants = RAMP_BY_KEY.get(entry.key) ?? [];
+  variants.push(entry);
+  RAMP_BY_KEY.set(entry.key, variants);
+}
 
 export function findRampModel(canonicalKey: string | null | undefined): RampMeta | undefined {
-  return canonicalKey ? RAMP_BY_KEY.get(canonicalKey) : undefined;
+  return findRampModels(canonicalKey)[0];
+}
+
+export function findRampModels(canonicalKey: string | null | undefined): RampMeta[] {
+  return canonicalKey ? (RAMP_BY_KEY.get(canonicalKey) ?? []) : [];
 }

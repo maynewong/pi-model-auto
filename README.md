@@ -143,6 +143,12 @@ Turn it off completely:
 
 One user turn keeps one model, including tool-call continuations. Automatic routing also avoids quota-cooled plans and avoids switching away from a useful warm cache when the switch is not worth it.
 
+### Context Window and Compaction
+
+Pi displays context usage and decides when to compact from the selected `pi-router/auto` model. The router keeps that virtual model's `contextWindow` synchronized with the concrete model selected for the current turn. It preselects the route before Pi's preflight compaction check, refreshes the value again when the provider request starts, and restores the most recent concrete model's window when resuming a session.
+
+As a result, a turn routed to a 272K model displays and compacts against 272K; a later turn routed to a 1M model switches the same limits to 1M. The initial 1M registration is only a startup placeholder before a session target can be identified.
+
 ## Settings
 
 | setting | use |

@@ -1,7 +1,14 @@
+/**
+ * Pi manages context against the selected `pi-router/auto` model, while this provider chooses a
+ * concrete model per turn. The virtual model is therefore refreshed after routing so Pi's footer
+ * and compaction threshold follow the model that actually serves the request.
+ */
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
+  buildSessionContext,
   CONFIG_DIR_NAME,
+  convertToLlm,
   getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
@@ -15,6 +22,7 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type Context,
+  type ImageContent,
   type Model,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
@@ -95,30 +103,14 @@ export default function modelRouter(pi: ExtensionAPI) {
   let pool: Pool = { cheapPool: [], strongPool: [], standardPool: [], unknownPool: [], all: [] };
   let forcedRoute: ForcedRoute | undefined;
   let lastDecision: LastDecision | undefined;
-  let turnSelection: { key: string; selection: Selection } | undefined;
+  let turnSelection: { key: string; selection: Selection; cacheReason?: CacheReason; pending?: boolean } | undefined;
   let routingState: RoutingState = createRoutingState();
   let classifierState: ClassifierState = createClassifierState();
   let lastClassification: ClassificationResult | undefined;
   let classifierRefreshSeq = 0;
+  let routerContextWindow: number | undefined;
 
-  pi.registerProvider("pi-router", {
-    name: "Pi Router",
-    api: "pi-router-api",
-    baseUrl: "https://router.local",
-    apiKey: "pi-router-dummy-key",
-    models: [
-      {
-        id: "auto",
-        name: "Pi Router (Auto)",
-        reasoning: true,
-        input: ["text", "image"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 1_000_000,
-        maxTokens: 64_000,
-      },
-    ],
-    streamSimple,
-  });
+  syncRouterContextWindow(1_000_000);
 
   pi.registerCommand("auto", {
     description: "Show Pi Model Router pool and last decision",
@@ -139,6 +131,9 @@ export default function modelRouter(pi: ExtensionAPI) {
     lastClassification = undefined;
     classifierRefreshSeq = 0;
 
+    const recentModel = mostRecentConcreteModel(ctx);
+    if (recentModel) syncRouterContextWindow(recentModel.contextWindow);
+
     updateRouterStatus(ctx, pool.all.length === 0 ? "🧭 no models" : "🧭 ready");
   });
 
@@ -158,14 +153,24 @@ export default function modelRouter(pi: ExtensionAPI) {
     extCtx = undefined;
   });
 
-  pi.on("input", async (event) => {
+  pi.on("input", async (event, ctx) => {
     if (event.source === "extension") return { action: "continue" };
 
     const parsed = parseForcedRoute(event.text);
     forcedRoute = parsed?.route;
-    if (!parsed) return { action: "continue" };
+    // Pi checks preflight compaction after input hooks but before `streamSimple`, so the target
+    // window must be installed here or a large→small model switch can miss its compact threshold.
+    if (isRouterModel(ctx.model) && !event.streamingBehavior) {
+      try {
+        await preselectTurn(ctx, inputRoutingContext(ctx, parsed?.text ?? event.text, event.images));
+      } catch {
+        turnSelection = undefined;
+      }
+    }
 
-    return { action: "transform", text: parsed.text, images: event.images };
+    return parsed
+      ? { action: "transform", text: parsed.text, images: event.images }
+      : { action: "continue" };
   });
 
   function streamSimple(routerModel: Model<Api>, context: Context, options?: SimpleStreamOptions) {
@@ -187,8 +192,10 @@ export default function modelRouter(pi: ExtensionAPI) {
         const quotaPlans = cfg.quota.enabled && !forcedRoute ? await resolveQuotaPlans(ctx, pool) : new Map();
         const turnKey = routingTurnKey(context);
         const cachedSelection = turnSelection;
+        const preselectedTurn = cachedSelection?.pending === true && cachedSelection.key === turnKey;
         const reuseTurnSelection =
-          decision.cls !== "model" && shouldReuseTurnSelection(context) && cachedSelection?.key === turnKey;
+          preselectedTurn ||
+          (decision.cls !== "model" && shouldReuseTurnSelection(context) && cachedSelection?.key === turnKey);
         // Re-evaluate time-of-day shadow-price windows once per turn (clock read here, pick reused
         // within the turn), so a window boundary like GLM 14:00–18:00 takes effect without a /reload.
         const selectionPool = decision.cls === "model" || reuseTurnSelection
@@ -199,9 +206,10 @@ export default function modelRouter(pi: ExtensionAPI) {
           );
 
         let selection: Selection;
-        let cacheReason: CacheReason | undefined;
+        let cacheReason: CacheReason | undefined = preselectedTurn ? cachedSelection?.cacheReason : undefined;
         if (reuseTurnSelection) {
-          selection = { ...cachedSelection!.selection, reason: `${cachedSelection!.selection.reason}; reused within user turn` };
+          const reuseReason = preselectedTurn ? "preselected before compaction" : "reused within user turn";
+          selection = { ...cachedSelection!.selection, reason: `${cachedSelection!.selection.reason}; ${reuseReason}` };
         } else {
           const fresh = selectModel(decision, selectionPool, context, options, ctx, cfg);
           // Cache-aware stickiness only applies to auto routing (forced routes are the user's explicit choice).
@@ -215,12 +223,14 @@ export default function modelRouter(pi: ExtensionAPI) {
         }
         const target = selection.selected.model;
 
-        if (decision.cls !== "model") turnSelection = { key: turnKey, selection };
+        turnSelection = { key: turnKey, selection, cacheReason };
 
         const selectedAuth = quotaPlans.get(modelKey(target))?.auth;
         const auth = selectedAuth ?? await ctx.modelRegistry.getApiKeyAndHeaders(target);
         if (!auth.ok) throw new Error(auth.error);
         const planKey = quotaPlans.get(modelKey(target))?.planKey ?? modelPlanKey(target, auth);
+
+        syncRouterContextWindow(target.contextWindow);
 
         const requestedReasoning = routingReasoning(
           selection.benchmarkEffort,
@@ -293,6 +303,86 @@ export default function modelRouter(pi: ExtensionAPI) {
     })();
 
     return stream;
+  }
+
+  async function preselectTurn(ctx: ExtensionContext, context: Context): Promise<void> {
+    if (pool.all.length === 0) return;
+
+    const cachedClassifier: TaskClassifier | undefined = lastClassification
+      ? { classify: () => lastClassification! }
+      : undefined;
+    const decision = decide(context, undefined, forcedRoute, cfg, cachedClassifier);
+    const quotaPlans = cfg.quota.enabled && !forcedRoute ? await resolveQuotaPlans(ctx, pool) : new Map();
+    const selectionPool = decision.cls === "model"
+      ? pool
+      : repriceForTimeOfDay(
+        forcedRoute ? pool : usablePoolForQuota(ctx, cfg, pool, quota, Date.now(), quotaPlans),
+        new Date().getHours(),
+      );
+    const fresh = selectModel(decision, selectionPool, context, undefined, ctx, cfg);
+    let selection = fresh;
+    let cacheReason: CacheReason | undefined;
+    if (!forcedRoute && decision.cls !== "model") {
+      const result = cacheAwareSelect(fresh, routingState, selectionPool, context, cfg);
+      selection = result.selection;
+      cacheReason = result.cacheReason;
+    }
+
+    turnSelection = { key: routingTurnKey(context), selection, cacheReason, pending: true };
+    syncRouterContextWindow(selection.selected.model.contextWindow);
+  }
+
+  function inputRoutingContext(
+    ctx: ExtensionContext,
+    text: string,
+    images: ImageContent[] | undefined,
+  ): Context {
+    const session = buildSessionContext(ctx.sessionManager.getBranch());
+    return {
+      systemPrompt: ctx.getSystemPrompt(),
+      messages: [
+        ...convertToLlm(session.messages),
+        {
+          role: "user",
+          content: [{ type: "text", text }, ...(images ?? [])],
+          timestamp: Date.now(),
+        },
+      ],
+    };
+  }
+
+  function mostRecentConcreteModel(ctx: ExtensionContext): Model<Api> | undefined {
+    const messages = buildSessionContext(ctx.sessionManager.getBranch()).messages;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (message.role !== "assistant" || message.provider === "pi-router") continue;
+      const model = ctx.modelRegistry.find(message.provider, message.model);
+      if (model) return model;
+    }
+    return undefined;
+  }
+
+  function syncRouterContextWindow(contextWindow: number): void {
+    if (routerContextWindow === contextWindow) return;
+    routerContextWindow = contextWindow;
+    pi.registerProvider("pi-router", {
+      name: "Pi Router",
+      api: "pi-router-api",
+      baseUrl: "https://router.local",
+      apiKey: "pi-router-dummy-key",
+      models: [
+        {
+          id: "auto",
+          name: "Pi Router (Auto)",
+          reasoning: true,
+          input: ["text", "image"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow,
+          maxTokens: 64_000,
+        },
+      ],
+      streamSimple,
+    });
   }
 
   function scheduleClassifierRefresh(ctx: ExtensionContext, context: Context): void {

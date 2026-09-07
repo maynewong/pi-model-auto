@@ -562,6 +562,48 @@ export function resolveModelVariants(model: Model<Api>, cfg: RouterConfig = DEFA
     }];
   }
 
+  const normalizedKey = normalizeModelKey(key);
+  const effortOrder = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  const effortOverrides = Object.entries(cfg.modelOverrides)
+    .map(([overrideKey, effortOverride]) => ({
+      effort: overrideKey.toLowerCase().slice(`${normalizedKey}-`.length),
+      effortOverride,
+      overrideKey: overrideKey.toLowerCase(),
+    }))
+    .filter(({ effort, effortOverride, overrideKey }) =>
+      overrideKey.startsWith(`${normalizedKey}-`) &&
+      effortOrder.includes(effort) &&
+      effortOverride.benchmarkEffort != null
+    )
+    .sort((a, b) => effortOrder.indexOf(a.effort) - effortOrder.indexOf(b.effort));
+
+  if (effortOverrides.length > 0) {
+    return effortOverrides.map(({ effortOverride }) => {
+      const base = effortOverride.priceBlended ?? blendedPriceFromCost(model) ?? resolution.priceBlended;
+      const effortCoef = effortOverride.costCoef ?? 1;
+      return {
+        model,
+        acceptsImage: model.input?.includes("image") ?? false,
+        canonicalKey: effortOverride.canonical ?? resolution.canonical?.key ?? normalizedKey,
+        costTier: effortOverride.costTier ?? resolution.costTier,
+        capabilityMode: effortOverride.capabilityMode ?? resolution.capabilityMode,
+        profiles: effortOverride.profiles ?? resolution.profiles,
+        frontier: effortOverride.frontier ?? resolution.frontier,
+        intelligence: effortOverride.intelligence ?? resolution.intelligence,
+        priceBlended: base * effortCoef,
+        scores: effortOverride.scores ?? resolution.scores,
+        tps: effortOverride.tps ?? resolution.tps,
+        benchmarkEffort: effortOverride.benchmarkEffort ?? resolution.benchmarkEffort,
+        supported: true,
+        confidence: resolution.canonical ? "medium" : "high",
+        matchReason: resolution.canonical
+          ? `user effort override + ${resolution.reason}`
+          : "user effort override for unknown model",
+        costCoefHours: effortOverride.costCoefHours,
+      };
+    });
+  }
+
   return resolutions.map((entry) => {
     const base = entry.supported ? entry.priceBlended : (blendedPriceFromCost(model) ?? entry.priceBlended);
     return {

@@ -460,6 +460,65 @@ describe("canonical model routing", () => {
     expect(buildAutoPool([model("local", "private-model")], cfg).all).toHaveLength(0);
   });
 
+  it("builds manual effort variants from normalized model-id overrides", () => {
+    const cfg: RouterConfig = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: {
+        "gpt-5.5-off": {
+          capabilityMode: "low",
+          intelligence: 40,
+          priceBlended: 0.4,
+          costTier: "standard",
+          frontier: true,
+          benchmarkEffort: "off",
+          profiles: ["balanced", "coder", "deep"],
+          scores: { coding: 40, agentic: 0.4 },
+        },
+        "gpt-5.5-low": {
+          capabilityMode: "medium",
+          intelligence: 70,
+          priceBlended: 0.85,
+          costTier: "standard",
+          frontier: true,
+          benchmarkEffort: "low",
+          profiles: ["balanced", "coder", "deep"],
+          scores: { coding: 70, agentic: 0.7 },
+        },
+        "gpt-5.5-high": {
+          capabilityMode: "high",
+          intelligence: 85,
+          priceBlended: 1.5,
+          costTier: "premium",
+          frontier: true,
+          benchmarkEffort: "high",
+          profiles: ["balanced", "coder", "deep"],
+          scores: { coding: 85, agentic: 0.85 },
+        },
+        "gpt-5.5-xhigh": {
+          capabilityMode: "ultra",
+          intelligence: 90,
+          priceBlended: 2.5,
+          costTier: "premium",
+          frontier: true,
+          benchmarkEffort: "xhigh",
+          profiles: ["balanced", "coder", "deep"],
+          scores: { coding: 90, agentic: 0.9 },
+        },
+      },
+    };
+
+    const variants = resolveModelVariants(model("gateway", "gpt-5.5"), cfg);
+
+    expect(variants.map(variantKey)).toEqual([
+      "gateway/gpt-5.5@off",
+      "gateway/gpt-5.5@low",
+      "gateway/gpt-5.5@high",
+      "gateway/gpt-5.5@xhigh",
+    ]);
+    expect(variants.map((variant) => variant.capabilityMode)).toEqual(["low", "medium", "high", "ultra"]);
+    expect(variants.map((variant) => variant.intelligence)).toEqual([40, 70, 85, 90]);
+  });
+
   it("forced @ultra targets the Ultra capability mode (aa)", () => {
     const pool = buildAutoPool(
       [

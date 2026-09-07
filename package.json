@@ -55,6 +55,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest --run",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
-    "release": "npm version patch && git push --follow-tags && npm publish"
+    "release": "node scripts/release.mjs",
+    "release:check": "node scripts/release.mjs --dry-run"
   }
 }

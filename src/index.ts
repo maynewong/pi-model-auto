@@ -27,10 +27,7 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import {
-  AA_WILLINGNESS,
-  RAMP_WILLINGNESS,
   DEFAULT_CONFIG,
-  axisValue,
   buildAutoPool,
   cacheAwareSelect,
   createClassifierState,
@@ -38,7 +35,6 @@ import {
   decide,
   enableClassifierForPinnedModel,
   estimateContextTokens,
-  frontierChain,
   lastUserText,
   matchesModelFilter,
   mergeClassifierConfig,
@@ -88,7 +84,6 @@ interface LastDecision extends Decision {
   chosen: string;
   planKey: string;
   canonical: string | null;
-  costTier: string;
   capabilityMode?: string;
   profile?: string;
   benchmarkEffort?: string;
@@ -102,7 +97,7 @@ export default function modelRouter(pi: ExtensionAPI) {
   let extCtx: ExtensionContext | undefined;
   let cfg: RouterConfig = DEFAULT_CONFIG;
   let quota: QuotaState = new QuotaState(DEFAULT_CONFIG.quota);
-  let pool: Pool = { cheapPool: [], strongPool: [], standardPool: [], unknownPool: [], all: [] };
+  let pool: Pool = { all: [] };
   let forcedRoute: ForcedRoute | undefined;
   let lastDecision: LastDecision | undefined;
   let turnSelection: { key: string; decision: Decision; selection: Selection; cacheReason?: CacheReason; pending?: boolean } | undefined;
@@ -124,7 +119,7 @@ export default function modelRouter(pi: ExtensionAPI) {
     cfg = loadConfig(ctx);
     quota = new QuotaState(cfg.quota);
     quota.load(quotaStateFile());
-    pool = applyConfiguredTiers(buildAutoPool(ctx.modelRegistry.getAvailable(), cfg), cfg, ctx);
+    pool = buildAutoPool(ctx.modelRegistry.getAvailable(), cfg);
     turnSelection = undefined;
     routingState = createRoutingState();
     classifierState = createClassifierState();
@@ -193,7 +188,7 @@ export default function modelRouter(pi: ExtensionAPI) {
           preselectedTurn ||
           (shouldReuseTurnSelection(context) && cachedSelection?.key === turnKey && cachedSelection.decision.cls !== "model");
         const currentClassifier = !reuseTurnSelection && !shouldReuseTurnSelection(context)
-          ? await classifyCurrentTurnWhenUseful(ctx, context, options, quotaPlans)
+          ? await classifyCurrentTurnWhenEnabled(ctx, context)
           : undefined;
         const decision = reuseTurnSelection
           ? cachedSelection!.decision
@@ -248,7 +243,6 @@ export default function modelRouter(pi: ExtensionAPI) {
           chosen: modelKey(target),
           planKey,
           canonical: selection.selected.canonicalKey,
-          costTier: selection.selected.costTier,
           capabilityMode: selection.selected.capabilityMode,
           profile: selection.profile,
           benchmarkEffort: selection.benchmarkEffort,
@@ -311,7 +305,7 @@ export default function modelRouter(pi: ExtensionAPI) {
     if (pool.all.length === 0) return;
 
     const quotaPlans = cfg.quota.enabled && !forcedRoute ? await resolveQuotaPlans(ctx, pool) : new Map();
-    const currentClassifier = await classifyCurrentTurnWhenUseful(ctx, context, undefined, quotaPlans);
+    const currentClassifier = await classifyCurrentTurnWhenEnabled(ctx, context);
     const decision = decide(context, undefined, forcedRoute, cfg, currentClassifier ? { classify: () => currentClassifier } : undefined);
     const selectionPool = decision.cls === "model"
       ? pool
@@ -385,27 +379,11 @@ export default function modelRouter(pi: ExtensionAPI) {
     });
   }
 
-  async function classifyCurrentTurnWhenUseful(
+  async function classifyCurrentTurnWhenEnabled(
     ctx: ExtensionContext,
     context: Context,
-    options: SimpleStreamOptions | undefined,
-    quotaPlans: QuotaPlanLookup,
   ): Promise<ClassificationResult | undefined> {
     if (forcedRoute || !cfg.classifier.enabled) return undefined;
-
-    const heuristicDecision = decide(context, options, undefined, cfg);
-    const selectionPool = repriceForTimeOfDay(
-      usablePoolForQuota(ctx, cfg, pool, quota, Date.now(), quotaPlans),
-      new Date().getHours(),
-    );
-    const fresh = selectModel(heuristicDecision, selectionPool, context, options, ctx, cfg);
-    const draft = cacheAwareSelect(fresh, routingState, selectionPool, context, cfg).selection;
-    const previousSelectionKey = turnSelection && !turnSelection.pending
-      ? modelKey(turnSelection.selection.selected.model)
-      : undefined;
-    const previousKey = routingState.lease?.modelKey ?? previousSelectionKey;
-
-    if (previousKey && modelKey(draft.selected.model) === previousKey) return undefined;
     return classifyCurrentTurn(ctx, context);
   }
 
@@ -451,7 +429,7 @@ function classifierContext(context: Context): Context {
   return {
     systemPrompt: [
       "You are Pi Router's classifier. Classify the current user turn for model routing.",
-      "Return exactly one line and no prose: mode=<low|medium|high|ultra> profile=<balanced|coder|deep|fast|vision> score=<0..1>.",
+      "Return exactly one line and no prose: mode=<low|medium|high|ultra> profile=<balanced|coder|deep|fast|vision>.",
       "Mode is required capability, not cost. Cost is handled later by the router.",
       "Mode rubric:",
       "- low: trivial, explain, summarize, docs/copy edits, tiny localized change, low ambiguity.",
@@ -464,7 +442,6 @@ function classifierContext(context: Context): Context {
       "- coder for implementation, debugging, refactoring, tests, or code review.",
       "- deep for architecture, root-cause analysis, security, planning, or long-horizon reasoning.",
       "- balanced otherwise.",
-      "Score is position inside the chosen mode: low 0.00-0.29, medium 0.30-0.51, high 0.52-0.73, ultra 0.74-1.00.",
       "If uncertain between adjacent modes, choose the lower mode unless the task is risky, irreversible, security-sensitive, or explicitly asks for deep investigation.",
     ].join("\n"),
     messages: [{
@@ -513,44 +490,6 @@ function selectModel(
   return selection;
 }
 
-function applyConfiguredTiers(pool: Pool, cfg: RouterConfig, ctx: ExtensionContext): Pool {
-  const next: Pool = {
-    cheapPool: [...pool.cheapPool],
-    strongPool: [...pool.strongPool],
-    standardPool: [...pool.standardPool],
-    unknownPool: [...pool.unknownPool],
-    all: [...pool.all],
-  };
-
-  for (const mode of ["low", "medium", "high", "ultra"] as const) {
-    const ref = cfg.modeModels[mode];
-    if (!ref) continue;
-
-    const model = findModelByRef(ctx, ref);
-    if (!model) {
-      ctx.ui.notify(`Pi Router: configured ${mode} model not found or unauthenticated: ${ref}`, "warning");
-      continue;
-    }
-
-    const resolved = { ...resolveModel(model, cfg), capabilityMode: mode };
-    if (!matchesModelFilter(resolved, cfg.modelFilter)) {
-      ctx.ui.notify(`Pi Router: configured ${mode} model rejected by modelFilter: ${ref}`, "warning");
-      continue;
-    }
-
-    prependUnique(next.all, resolved);
-  }
-
-  return next;
-}
-
-function prependUnique(items: ResolvedModel[], item: ResolvedModel) {
-  const key = modelKey(item.model);
-  const existing = items.findIndex((candidate) => modelKey(candidate.model) === key);
-  if (existing >= 0) items.splice(existing, 1);
-  items.unshift(item);
-}
-
 function findModelByRef(ctx: ExtensionContext, ref: string): Model<Api> | undefined {
   const [provider, ...idParts] = ref.split("/");
   const id = idParts.join("/");
@@ -587,13 +526,22 @@ function isInitialUserTurn(ctx: ExtensionContext): boolean {
 
 function loadConfig(ctx: ExtensionContext): RouterConfig {
   let cfg = DEFAULT_CONFIG;
-  let userWillingness: Partial<RouterConfig["willingness"]> = {};
+  let classifierExplicitlyDisabled = false;
   for (const file of configPaths(ctx)) {
     if (!existsSync(file)) continue;
 
     try {
       const parsed = JSON.parse(readFileSync(file, "utf8"));
       const router = parsed.router ?? parsed;
+      const rawClassifier = router.classifier;
+      if (rawClassifier === "off" || rawClassifier === false ||
+          (rawClassifier && typeof rawClassifier === "object" && rawClassifier.enabled === false)) {
+        classifierExplicitlyDisabled = true;
+      } else if (rawClassifier && typeof rawClassifier === "object" && rawClassifier.enabled === true) {
+        classifierExplicitlyDisabled = false;
+      }
+      const classifierModel = typeof router.classifierModel === "string" ? router.classifierModel : cfg.classifierModel;
+      const mergedClassifier = mergeClassifierConfig(rawClassifier, cfg.classifier);
       cfg = {
         ...cfg,
         ...router,
@@ -601,25 +549,21 @@ function loadConfig(ctx: ExtensionContext): RouterConfig {
         modeModels: { ...cfg.modeModels, ...(router.modeModels ?? router.models ?? {}) },
         modelFilter: { ...cfg.modelFilter, ...(router.modelFilter ?? {}) },
         modelOverrides: { ...cfg.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
+        selectionPolicy: router.selectionPolicy === "cost" || router.selectionPolicy === "quality"
+          ? router.selectionPolicy
+          : cfg.selectionPolicy,
         cacheAware: { ...cfg.cacheAware, ...(router.cacheAware ?? {}) },
         quota: { ...cfg.quota, ...(router.quota ?? {}) },
-        classifierModel: typeof router.classifierModel === "string" ? router.classifierModel : cfg.classifierModel,
-        classifier: enableClassifierForPinnedModel(
-          mergeClassifierConfig(router.classifier, cfg.classifier),
-          typeof router.classifierModel === "string" ? router.classifierModel : cfg.classifierModel,
-          router.classifier,
-        ),
+        classifierModel,
+        classifier: classifierExplicitlyDisabled
+          ? { ...mergedClassifier, enabled: false }
+          : enableClassifierForPinnedModel(mergedClassifier, classifierModel, rawClassifier),
       };
-      if (router.willingness) userWillingness = { ...userWillingness, ...router.willingness };
     } catch (error) {
       ctx.ui.notify(`Pi Router: failed to read ${file}: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
   }
 
-  // The $/quality-point budgets live on different scales per source (list price vs measured cost-per-task),
-  // so the base willingness follows capabilitySource; explicit user values overlay it.
-  const baseWillingness = cfg.capabilitySource === "aa" ? AA_WILLINGNESS : RAMP_WILLINGNESS;
-  cfg = { ...cfg, willingness: { ...baseWillingness, ...userWillingness } };
   return cfg;
 }
 
@@ -642,20 +586,17 @@ function describeRouter(
   const lines = [
     "Pi Router",
     `capabilitySource: ${cfg.capabilitySource}`,
-    `cacheAware: ${cfg.cacheAware.enabled}`,
+    `selectionPolicy: ${cfg.selectionPolicy}`,
+    `sessionPolicy: ${cfg.cacheAware.enabled ? "sticky" : "adaptive"}`,
     `modelFilter: include=[${cfg.modelFilter.include.join(", ") || "*"}] exclude=[${cfg.modelFilter.exclude.join(", ") || "none"}]`,
     `quota: ${cfg.quota.enabled ? "enabled" : "disabled"}`,
-    `costCheapPool: ${pool.cheapPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
-    `frontierPool: ${pool.strongPool.map((item) => `${modelKey(item.model)}(${item.canonicalKey ?? "unknown"}/${item.costTier}/${item.profiles.join("+")})`).join(", ") || "none"}`,
-    `costStandardPool: ${pool.standardPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
-    `unknownPool: ${pool.unknownPool.map((item) => modelKey(item.model)).join(", ") || "none"}`,
-    "frontier (auto climbs these Low→Ultra by mode):",
-    ...(["coder", "deep", "balanced"] as const).map((profile) => {
-      const chain = frontierChain(pool.all, profile);
-      const points = chain
-        .map((item) => `${displayVariantName(item)}(${axisValue(item, profile).toFixed(0)}@$${item.priceBlended})`)
-        .join(" → ");
-      return `  ${profile}: ${points || "none"}`;
+    "models by capability mode:",
+    ...(["low", "medium", "high", "ultra"] as const).map((mode) => {
+      const models = pool.all
+        .filter((item) => item.capabilityMode === mode)
+        .map((item) => `${displayVariantName(item)}(${item.intelligence.toFixed(1)}@$${item.priceBlended})`)
+        .join(", ");
+      return `  ${mode}: ${models || "none"}`;
     }),
   ];
 
@@ -665,7 +606,6 @@ function describeRouter(
       `  chosen: ${lastDecision.chosen}`,
       `  planKey: ${lastDecision.planKey}`,
       `  canonical: ${lastDecision.canonical ?? "unknown"}`,
-      `  costTier: ${lastDecision.costTier}`,
       `  capabilityMode: ${lastDecision.capabilityMode ?? "unknown"}`,
       `  profile: ${lastDecision.profile ?? "unknown"}`,
       `  benchmarkEffort: ${lastDecision.benchmarkEffort ?? "unknown"}`,
@@ -794,7 +734,7 @@ function shortStatus(decision: LastDecision, quota: QuotaState): string {
   const effort = decision.reasoning && decision.reasoning !== "off" ? `@${decision.reasoning}` : "";
   const mode = decision.capabilityMode
     ? decision.capabilityMode[0].toUpperCase() + decision.capabilityMode.slice(1)
-    : `cost:${decision.costTier}`;
+    : "Unknown";
   return `🧭 ${model}${effort} · ${mode}${quotaStatusTag(quota.snapshot(decision.planKey), Date.now())}`;
 }
 

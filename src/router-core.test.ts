@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { Api, Context, Model, Usage } from "@earendil-works/pi-ai";
 import {
-  AA_WILLINGNESS,
   DEFAULT_CONFIG,
+  axisValue,
   aaCapabilityMode,
   buildAutoPool,
   cacheAwareSelect,
@@ -16,6 +16,7 @@ import {
   inferRequestedProfile,
   isClassifierModelDisabled,
   mergeClassifierConfig,
+  modelKey,
   normalizeModelKey,
   parseClassificationOutput,
   recordClassifierFailure,
@@ -44,7 +45,9 @@ import { buildPlanKey, QuotaState } from "./quota.ts";
 
 // The default source is `ramp`; this is the explicit `aa` counterpart for tests that exercise the
 // Artificial Analysis table (the two sources are never merged).
-const AA: RouterConfig = { ...DEFAULT_CONFIG, capabilitySource: "aa", willingness: AA_WILLINGNESS };
+const AA: RouterConfig = { ...DEFAULT_CONFIG, capabilitySource: "aa" };
+const COST_RAMP: RouterConfig = { ...DEFAULT_CONFIG, selectionPolicy: "cost" };
+const COST_AA: RouterConfig = { ...AA, selectionPolicy: "cost" };
 
 function ultraDecision(ctx: Context, cfg: RouterConfig = DEFAULT_CONFIG) {
   return decide(ctx, undefined, { mode: "ultra" }, cfg);
@@ -122,11 +125,11 @@ describe("canonical model routing", () => {
       model("anthropic", "claude-fable-5"),
     ];
     expect(resolveRouteModel({ models, hint: "low", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
-      .toBe("gateway/gpt-5.4-nano");
+      .toBe("gateway/qwen3.7-plus");
     expect(resolveRouteModel({ models, hint: "medium", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
       .toBe("gateway/deepseek-v4-flash");
     expect(resolveRouteModel({ models, hint: "high", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
-      .toBe("gateway/kimi-k2.7-code");
+      .toBe("gateway-codex/gpt-5.5");
     expect(resolveRouteModel({ models, hint: "ultra", context: context("small task"), cfg: DEFAULT_CONFIG })?.key)
       .toBe("anthropic/claude-fable-5");
     expect(resolveRouteModel({ models, hint: "cheap", context: context("small task"), cfg: DEFAULT_CONFIG })).toBeUndefined();
@@ -150,6 +153,7 @@ describe("canonical model routing", () => {
       writeFileSync(join(root, "model-router.json"), JSON.stringify({
         router: {
           capabilitySource: "aa",
+          selectionPolicy: "cost",
           modelFilter: { include: ["gateway"] },
           modeModels: { ultra: "gateway/gpt-5.6-luna" },
           modelOverrides: { custom: { costCoef: 0.2 } },
@@ -162,7 +166,7 @@ describe("canonical model routing", () => {
       expect(cfg.modelFilter.include).toEqual(["gateway"]);
       expect(cfg.modeModels.ultra).toBe("gateway/gpt-5.6-luna");
       expect(cfg.modelOverrides.custom?.costCoef).toBe(0.2);
-      expect(cfg.willingness).toEqual(AA_WILLINGNESS);
+      expect(cfg.selectionPolicy).toBe("cost");
       expect(cfg.classifier.enabled).toBe(false);
       expect(cfg.classifierModel).toBe("gateway/gpt-5.6-luna");
     } finally {
@@ -210,9 +214,9 @@ describe("canonical model routing", () => {
       );
       quota.persist(join(root, "quota-state.json"));
 
-      expect(resolveRouteModel({ models, hint: "low", context: context("small task"), cfg: DEFAULT_CONFIG, agentDir: root })?.key)
+      expect(resolveRouteModel({ models, hint: "low", context: context("small task"), cfg: COST_RAMP, agentDir: root })?.key)
         .toBe("fallback-provider/gpt-5.4");
-      expect(resolveRouteModel({ models, hint: "low", context: context("small task"), cfg: DEFAULT_CONFIG, agentDir: root, filterQuota: false })?.key)
+      expect(resolveRouteModel({ models, hint: "low", context: context("small task"), cfg: COST_RAMP, agentDir: root, filterQuota: false })?.key)
         .toBe("cheap-provider/qwen3.7-plus");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -242,20 +246,20 @@ describe("canonical model routing", () => {
     expect(rampCapabilityMode(74.9)).toBe("low");
   });
 
-  it("maps AA Intelligence Index boundaries to capability modes", () => {
-    expect(aaCapabilityMode(56)).toBe("ultra");
-    expect(aaCapabilityMode(55.9)).toBe("high");
-    expect(aaCapabilityMode(52)).toBe("high");
-    expect(aaCapabilityMode(51.9)).toBe("medium");
-    expect(aaCapabilityMode(41.1)).toBe("medium");
-    expect(aaCapabilityMode(41)).toBe("low");
+  it("maps AA v4.2 Intelligence Index boundaries to capability modes", () => {
+    expect(aaCapabilityMode(52)).toBe("ultra");
+    expect(aaCapabilityMode(51.9)).toBe("high");
+    expect(aaCapabilityMode(47)).toBe("high");
+    expect(aaCapabilityMode(46.9)).toBe("medium");
+    expect(aaCapabilityMode(40)).toBe("medium");
+    expect(aaCapabilityMode(39.9)).toBe("low");
   });
 
-  it("keeps Ramp capability mode independent from cost tier", () => {
-    expect(resolveCanonicalModel("gateway/claude-fable-5", "ramp")).toMatchObject({ capabilityMode: "ultra", costTier: "premium" });
-    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp")).toMatchObject({ capabilityMode: "high", costTier: "standard" });
-    expect(resolveCanonicalModel("gateway/gpt-5.6-terra", "ramp")).toMatchObject({ capabilityMode: "medium", costTier: "cheap" });
-    expect(resolveCanonicalModel("gateway/gpt-5.4", "ramp")).toMatchObject({ capabilityMode: "low", costTier: "standard" });
+  it("assigns Ramp capability modes independently from continuous price", () => {
+    expect(resolveCanonicalModel("gateway/claude-fable-5", "ramp")).toMatchObject({ capabilityMode: "ultra", priceBlended: 2.62 });
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp")).toMatchObject({ capabilityMode: "high", priceBlended: 0.99 });
+    expect(resolveCanonicalModel("gateway/gpt-5.6-terra", "ramp")).toMatchObject({ capabilityMode: "medium", priceBlended: 0.26 });
+    expect(resolveCanonicalModel("gateway/gpt-5.4", "ramp")).toMatchObject({ capabilityMode: "low", priceBlended: 0.64 });
   });
 
   it("uses benchmark effort for auto routes and UI effort for forced models", () => {
@@ -289,7 +293,7 @@ describe("canonical model routing", () => {
 
     const aa = resolveCanonicalModel("gateway/kimi-k2.7-code", "aa");
     expect(aa.supported).toBe(true);
-    expect(aa.intelligence).toBe(41.9); // synthetic intelligence index
+    expect(aa.intelligence).toBe(33.9); // Artificial Analysis Intelligence Index v4.2
 
     // Canonical name known, but Ramp never ran it: unsupported under ramp, supported under aa.
     expect(resolveCanonicalModel("gateway/gemini-3.5-flash", "ramp").supported).toBe(false);
@@ -300,7 +304,7 @@ describe("canonical model routing", () => {
     expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").intelligence).toBe(83.3);
     expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").benchmarkEffort).toBe("high");
     expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "aa").supported).toBe(true);
-    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "aa").intelligence).toBeCloseTo(58.89, 2);
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "aa").intelligence).toBe(51.3);
     expect(resolveCanonicalModel("gateway/kimi-k3", "ramp")).toMatchObject({
       supported: true,
       intelligence: 87.2,
@@ -308,7 +312,9 @@ describe("canonical model routing", () => {
       benchmarkEffort: "high",
       capabilityMode: "ultra",
     });
-    expect(resolveCanonicalModel("gateway/kimi-k3", "aa").supported).toBe(true);
+    expect(resolveCanonicalModel("gateway/kimi-k3", "aa")).toMatchObject({ supported: true, capabilityMode: "high" });
+    expect(resolveCanonicalModel("gateway/gpt-5.6-luna", "aa")).toMatchObject({ capabilityMode: "medium", priceBlended: 0.45 });
+    expect(resolveCanonicalModel("gateway/claude-fable-5.1", "aa")).toMatchObject({ capabilityMode: "ultra", intelligence: 56.8 });
     expect(resolveCanonicalModel("gateway/deepseek-v4-flash", "ramp")).toMatchObject({
       supported: true,
       intelligence: 79.5,
@@ -318,50 +324,76 @@ describe("canonical model routing", () => {
     });
   });
 
-  it("keeps full Ramp coverage separate from the highlighted score-spend wall", () => {
+  it("uses the general AA index when a profile sub-index is missing", () => {
+    const [item] = buildAutoPool([model("gateway", "qwen3.7-plus")], AA).all;
+    expect(item.scores?.agentic).toBeUndefined();
+    expect(axisValue(item, "deep")).toBe(item.intelligence);
+  });
+
+  it("supports quality-first and cost-first selection inside an AA mode", () => {
+    const models = [model("gateway", "gemini-3.8-flash"), model("gateway", "glm-5.3"), model("gateway", "gpt-5.6-sol")];
+    const coder = context("implement a typescript helper");
+    const decision = { cls: "high" as const, score: 0.6, chosen: "", modeBucket: 2, requestedProfile: "coder" as const };
+    expect(selectFromPool(decision, buildAutoPool(models, AA), coder, undefined, AA)?.selected.canonicalKey).toBe("gpt-5.6-sol");
+    expect(selectFromPool(decision, buildAutoPool(models, COST_AA), coder, undefined, COST_AA)?.selected.canonicalKey).toBe("gemini-3.8-flash");
+  });
+
+  it("honors an exact mode pin before quality or cost policy", () => {
+    const models = [model("gateway", "gemini-3.8-flash"), model("gateway", "glm-5.3"), model("gateway", "gpt-5.6-sol")];
+    const cfg = { ...AA, modeModels: { high: "gateway/glm-5.3" } };
+    const decision = { cls: "high" as const, score: 0.6, chosen: "", modeBucket: 2, requestedProfile: "coder" as const };
+    expect(selectFromPool(decision, buildAutoPool(models, cfg), context("code"), undefined, cfg)?.selected.canonicalKey).toBe("glm-5.3");
+    expect(resolveRouteModel({ models, hint: "high", cfg })?.key).toBe("gateway/glm-5.3");
+  });
+
+  it("includes an explicitly pinned private model without benchmark metadata", () => {
+    const privateModel = model("private", "house-model");
+    const cfg = { ...DEFAULT_CONFIG, modeModels: { ultra: "private/house-model" } };
+    expect(resolveRouteModel({ models: [privateModel, model("gateway", "claude-opus-5")], hint: "ultra", cfg })?.key)
+      .toBe("private/house-model");
+  });
+
+  it("treats a cross-mode pin as the requested mode without changing its intrinsic pool mode", () => {
+    const models = [model("gateway", "gpt-5.6-luna"), model("gateway", "glm-5.3")];
+    const cfg = { ...AA, modeModels: { ultra: "gateway/gpt-5.6-luna" } };
+    const pool = buildAutoPool(models, cfg);
+    expect(item(pool, "gpt-5.6-luna").capabilityMode).toBe("medium");
+    expect(selectFromPool(ultraDecision(context("hard"), cfg), pool, context("hard"), undefined, cfg)?.selected)
+      .toMatchObject({ canonicalKey: "gpt-5.6-luna", capabilityMode: "ultra" });
+  });
+
+  it("never admits the virtual router or a non-text endpoint through a mode pin", () => {
+    const router = model("pi-router", "auto");
+    const imageOnly = model("private", "image-only");
+    imageOnly.input = ["image"];
+    const cfg = { ...DEFAULT_CONFIG, modeModels: { low: "pi-router/auto", ultra: "private/image-only" } };
+    const pool = buildAutoPool([router, imageOnly, model("gateway", "gpt-5.4-nano")], cfg);
+    expect(pool.all.map((entry) => modelKey(entry.model))).not.toContain("pi-router/auto");
+    expect(pool.all.map((entry) => modelKey(entry.model))).not.toContain("private/image-only");
+  });
+
+  it("keeps full Ramp benchmark coverage available to mode routing", () => {
     expect(resolveCanonicalModel("gateway/gpt-5.4", "ramp")).toMatchObject({
       supported: true,
       intelligence: 74.4,
       capabilityMode: "low",
-      frontier: false,
     });
     expect(resolveCanonicalModel("gateway/gemini-3.1-pro", "ramp")).toMatchObject({
       supported: true,
       intelligence: 74.4,
       capabilityMode: "low",
-      frontier: false,
     });
     expect(resolveCanonicalModel("gateway/kimi-k2.7-code", "ramp")).toMatchObject({
       supported: true,
       capabilityMode: "high",
-      frontier: false,
     });
-    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp")).toMatchObject({ frontier: true });
+    expect(resolveCanonicalModel("gateway/gpt-5.6-sol", "ramp").supported).toBe(true);
   });
 
   it("represents benchmark results as model-effort routing variants", () => {
     const variants = resolveModelVariants(model("anthropic", "claude-fable-5"), DEFAULT_CONFIG);
     expect(variants.map(variantKey)).toEqual(["anthropic/claude-fable-5@xhigh"]);
     expect(variants[0].matchReason).toContain("claude-fable-5@xhigh");
-  });
-
-  it("does not classify frontier models as cheap when costs are zero (aa)", () => {
-    const pool = buildAutoPool(
-      [
-        model("gateway-codex", "gpt-5.5"),
-        model("gateway-codex", "gpt-5.4"),
-        model("gateway", "deepseek-v4-flash"),
-        model("gateway", "kimi-k2.7-code-highspeed"),
-      ],
-      AA,
-    );
-
-    expect(pool.cheapPool.map((item) => item.canonicalKey)).toEqual(["deepseek-v4-flash"]);
-    expect(pool.strongPool.map((item) => item.canonicalKey).sort()).toEqual([
-      "gpt-5.4",
-      "gpt-5.5",
-      "kimi-k2.7-code-highspeed",
-    ]);
   });
 
   it("filters models by provider/id/name/canonical substring", () => {
@@ -376,11 +408,9 @@ describe("canonical model routing", () => {
     );
 
     expect(pool.all.map((item) => `${item.model.provider}/${item.model.id}`)).toEqual([
-      "gateway/deepseek-v4-flash",
       "gateway-codex/gpt-5.5",
+      "gateway/deepseek-v4-flash",
     ]);
-    expect(pool.cheapPool.map((item) => item.model.provider)).toEqual(["gateway"]);
-    expect(pool.strongPool.map((item) => item.model.provider)).toEqual(["gateway-codex"]);
   });
 
   it("applies exclude after include", () => {
@@ -396,9 +426,6 @@ describe("canonical model routing", () => {
     // No canonical match at all.
     const unknown = buildAutoPool([model("local", "Qwen3.6-35B-A3B-UD-MLX-4bit")]);
     expect(unknown.all).toHaveLength(0);
-    expect(unknown.cheapPool).toHaveLength(0);
-    expect(unknown.strongPool).toHaveLength(0);
-    expect(unknown.unknownPool).toHaveLength(0);
 
     // Canonical name known, but no Ramp result: out under ramp, in under aa.
     const noRamp = [model("gateway", "gemini-3.5-flash")];
@@ -412,17 +439,25 @@ describe("canonical model routing", () => {
       modelOverrides: {
         "local/Qwen3.6-35B-A3B-UD-MLX-4bit": {
           canonical: "qwen3.6-35b-a3b-ud-mlx-4bit",
-          costTier: "cheap",
+          capabilityMode: "low",
           profiles: ["fast", "coder"],
-          frontier: false,
         },
       },
     });
 
-    expect(pool.unknownPool).toHaveLength(0);
-    expect(pool.cheapPool[0].canonicalKey).toBe("qwen3.6-35b-a3b-ud-mlx-4bit");
-    expect(pool.cheapPool[0].profiles).toEqual(["fast", "coder"]);
-    expect(pool.cheapPool[0].matchReason).toBe("user override for unknown model");
+    expect(pool.all[0].canonicalKey).toBe("qwen3.6-35b-a3b-ud-mlx-4bit");
+    expect(pool.all[0].profiles).toEqual(["fast", "coder"]);
+    expect(pool.all[0].matchReason).toBe("user override for unknown model");
+  });
+
+  it("ignores removed legacy-only override fields", () => {
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      modelOverrides: {
+        "local/private-model": { costTier: "cheap", frontier: true },
+      },
+    } as unknown as RouterConfig;
+    expect(buildAutoPool([model("local", "private-model")], cfg).all).toHaveLength(0);
   });
 
   it("forced @ultra targets the Ultra capability mode (aa)", () => {
@@ -465,7 +500,7 @@ describe("canonical model routing", () => {
     expect(decision.modeBucket).toBe(3);
     expect(decision.score).toBe(0.86);
     expect(decision.requestedProfile).toBe("fast");
-    expect(selectFromPool(decision, pool, request, undefined, AA)?.selected.canonicalKey).toBe("glm-5.2");
+    expect(selectFromPool(decision, pool, request, undefined, AA)?.selected.canonicalKey).toBe("gpt-5.5");
   });
 
   it("does not let stale classifier profiles affect forced modes", () => {
@@ -532,7 +567,7 @@ describe("canonical model routing", () => {
       cfg,
     )?.selected.canonicalKey;
 
-  it("climbs the language-neutral frontier by mode (aa)", () => {
+  it("routes across all language-neutral capability modes (aa)", () => {
     const pool = buildAutoPool(
       [
         model("gateway", "deepseek-v4-flash"),
@@ -547,9 +582,9 @@ describe("canonical model routing", () => {
     const coder = context("implement a typescript helper");
     const pick = (bucket: number) => pickAtBucket(pool, coder, AA, bucket);
 
-    // The stricter AA thresholds move more models into Low/Medium and keep High selective.
-    expect(pick(0)).toBe("deepseek-v4-flash");
-    expect(pick(1)).toBe("deepseek-v4-pro");
+    // Quality policy picks the strongest profile score in the requested mode.
+    expect(pick(0)).toBe("kimi-k2.7-code");
+    expect(pick(1)).toBe("gpt-5.5");
     expect(pick(2)).toBe("gpt-5.5");
     expect(pick(3)).toBe("gpt-5.5");
   });
@@ -568,100 +603,51 @@ describe("canonical model routing", () => {
     const coder = context("implement a typescript helper");
     const pick = (bucket: number) => pickAtBucket(pool, coder, DEFAULT_CONFIG, bucket);
 
-    // The lower edge of each bucket picks the cheapest model meeting that mode's solve-rate floor.
-    expect(pick(0)).toBe("gpt-5.4-nano");
+    expect(pick(0)).toBe("gpt-5.4");
     expect(pick(1)).toBe("deepseek-v4-flash");
-    expect(pick(2)).toBe("kimi-k2.7-code");
+    expect(pick(2)).toBe("gpt-5.5");
     expect(pick(3)).toBe("claude-fable-5");
   });
 
-  it("prefers an affordable Ramp wall point but preserves local fallbacks", () => {
-    const coder = context("implement a typescript helper");
-    const decision = { cls: "high" as const, score: 0.52, chosen: "", modeBucket: 2, requestedProfile: "coder" as const };
-    const pick = (models: Model<Api>[], cfg: RouterConfig = DEFAULT_CONFIG) => selectFromPool(
-      decision,
-      buildAutoPool(models, cfg),
-      coder,
-      undefined,
-      cfg,
-    )?.selected.canonicalKey;
-
-    const both = [model("gateway", "kimi-k2.7-code"), model("gateway", "gpt-5.6-sol")];
-    expect(pick(both)).toBe("gpt-5.6-sol");
-    expect(pick([model("gateway", "kimi-k2.7-code")])).toBe("kimi-k2.7-code");
-
-    const localEconomics = {
-      ...DEFAULT_CONFIG,
-      modelOverrides: { "gateway/kimi-k2.7-code": { costCoef: 0.1 } },
-    };
-    expect(pick(both, localEconomics)).toBe("kimi-k2.7-code");
-
-    const ultraBase = selectFromPool(
-      { cls: "ultra", score: 0.74, chosen: "", modeBucket: 3, requestedProfile: "coder" },
-      buildAutoPool([model("gateway", "kimi-k3"), model("gateway", "claude-opus-5")]),
-      coder,
-      undefined,
-      DEFAULT_CONFIG,
-    );
-    expect(ultraBase?.selected.canonicalKey).toBe("kimi-k3");
-  });
-
-  it("selects the cheapest model meeting the continuous floor inside a Ramp mode", () => {
-    const cfg: RouterConfig = {
-      ...DEFAULT_CONFIG,
-      modelOverrides: {
-        "gateway/glm-5.2": { costCoef: 0.35 },
-        "gateway-codex/gpt-5.5": { costCoef: 0.6 },
-      },
-    };
+  it("defaults to the strongest model inside the requested mode", () => {
     const pool = buildAutoPool([
+      model("gateway", "kimi-k2.7-code"),
       model("gateway", "glm-5.2"),
       model("gateway", "gpt-5.6-sol"),
-      model("gateway-codex", "gpt-5.5"),
-      model("anthropic", "claude-fable-5"),
-    ], cfg);
-    const coder = context("implement a typescript helper");
-    const pick = (score: number) => selectFromPool(
-      { cls: "high", score, chosen: "", modeBucket: 2, requestedProfile: "coder" },
-      pool,
-      coder,
-      undefined,
-      cfg,
-    )?.selected.canonicalKey;
-
-    expect(pick(0.52)).toBe("glm-5.2");
-    expect(pick(0.58)).toBe("glm-5.2");
-    expect(pick(0.63)).toBe("gpt-5.6-sol");
-  });
-
-  it("allows an affordable willingness upgrade only within the selected Ramp mode", () => {
-    const cfg: RouterConfig = {
-      ...DEFAULT_CONFIG,
-      modelOverrides: {
-        "gateway/glm-5.2": { costCoef: 0.52 },
-        "gateway-codex/gpt-5.5": { costCoef: 0.6 },
-      },
-    };
-    const pool = buildAutoPool([
-      model("gateway", "glm-5.2"),
-      model("gateway", "gpt-5.6-sol"),
-      model("gateway-codex", "gpt-5.5"),
-      model("anthropic", "claude-fable-5"),
-    ], cfg);
+    ]);
     const coder = context("implement a typescript helper");
     const selection = selectFromPool(
       { cls: "high", score: 0.6, chosen: "", modeBucket: 2, requestedProfile: "coder" },
       pool,
       coder,
       undefined,
-      cfg,
+      DEFAULT_CONFIG,
     );
 
+    expect(DEFAULT_CONFIG.selectionPolicy).toBe("quality");
     expect(selection?.selected.canonicalKey).toBe("gpt-5.6-sol");
     expect(selection?.selected.capabilityMode).toBe("high");
   });
 
-  it("does not cross into Ultra before the task leaves High", () => {
+  it("lets cost-sensitive users choose the cheapest model inside the requested mode", () => {
+    const pool = buildAutoPool([
+      model("gateway", "kimi-k2.7-code"),
+      model("gateway", "glm-5.2"),
+      model("gateway", "gpt-5.6-sol"),
+    ], COST_RAMP);
+    const coder = context("implement a typescript helper");
+    const selection = selectFromPool(
+      { cls: "high", score: 0.6, chosen: "", modeBucket: 2, requestedProfile: "coder" },
+      pool,
+      coder,
+      undefined,
+      COST_RAMP,
+    );
+
+    expect(selection?.selected.canonicalKey).toBe("kimi-k2.7-code");
+  });
+
+  it("keeps selection inside the requested mode", () => {
     const pool = buildAutoPool([
       model("gateway", "glm-5.2"),
       model("anthropic", "claude-fable-5"),
@@ -678,45 +664,45 @@ describe("canonical model routing", () => {
     expect(selection?.selected.canonicalKey).toBe("glm-5.2");
   });
 
-  it("borrows the nearest stronger Ramp mode when the target mode is absent", () => {
-    const cfg: RouterConfig = {
-      ...DEFAULT_CONFIG,
-      modelOverrides: { "anthropic/claude-fable-5": { costCoef: 10 } },
-    };
-    const pool = buildAutoPool([
-      model("gateway-codex", "gpt-5.4"),
-      model("anthropic", "claude-fable-5"),
-    ], cfg);
+  it("borrows the nearest stronger mode, then the strongest lower mode", () => {
     const coder = context("implement a typescript helper");
-    const selection = selectFromPool(
+    const stronger = buildAutoPool([model("gateway-codex", "gpt-5.4"), model("anthropic", "claude-fable-5")]);
+    const high = selectFromPool(
       { cls: "high", score: 0.6, chosen: "", modeBucket: 2, requestedProfile: "coder" },
-      pool,
+      stronger,
       coder,
       undefined,
-      cfg,
+      DEFAULT_CONFIG,
     );
+    expect(high?.selected.canonicalKey).toBe("claude-fable-5");
+    expect(high?.reason).toContain("high unavailable");
 
-    expect(selection?.selected.canonicalKey).toBe("claude-fable-5");
-    expect(selection?.reason).toContain("high unavailable");
+    const lower = buildAutoPool([model("gateway-codex", "gpt-5.4")]);
+    const ultra = selectFromPool(
+      { cls: "ultra", score: 0.86, chosen: "", modeBucket: 3, requestedProfile: "coder" },
+      lower,
+      coder,
+      undefined,
+      DEFAULT_CONFIG,
+    );
+    expect(ultra?.selected.canonicalKey).toBe("gpt-5.4");
+    expect(ultra?.reason).toContain("ultra unavailable");
   });
 
-  it("falls back to Pareto routing for manual Ramp overrides without a capability mode", () => {
+  it("falls back to policy routing for manual overrides without a capability mode", () => {
     const cfg: RouterConfig = {
       ...DEFAULT_CONFIG,
       modelOverrides: {
         "local/private-coder": {
           intelligence: 70,
           priceBlended: 0.1,
-          costTier: "cheap",
           profiles: ["coder"],
         },
       },
     };
     const pool = buildAutoPool([model("local", "private-coder")], cfg);
     const coder = context("implement a typescript helper");
-
-    expect(selectFromPool(lowDecision(coder, cfg), pool, coder, undefined, cfg)?.selected.canonicalKey)
-      .toBe("private-coder");
+    expect(selectFromPool(lowDecision(coder, cfg), pool, coder, undefined, cfg)?.selected.canonicalKey).toBe("private-coder");
   });
 
   it("carries benchmark effort through the selected routing variant", () => {
@@ -731,31 +717,15 @@ describe("canonical model routing", () => {
 
     expect(selection?.selected.canonicalKey).toBe("claude-fable-5");
     expect(selection?.benchmarkEffort).toBe("xhigh");
-    expect(selection?.alternatives).toContain("gateway/glm-5.2@high");
   });
 
-  it("scales the cost axis by the shadow-price coefficient", () => {
+  it("scales the effective price by the user cost coefficient", () => {
     expect(item(buildAutoPool([model("gateway", "glm-5.2")]), "glm-5.2").priceBlended).toBe(1.84);
-
     const discounted = buildAutoPool([model("gateway", "glm-5.2")], {
-      ...DEFAULT_CONFIG,
+      ...COST_RAMP,
       modelOverrides: { "gateway/glm-5.2": { costCoef: 0.25 } },
     });
     expect(item(discounted, "glm-5.2").priceBlended).toBeCloseTo(0.46);
-  });
-
-  it("lets a paid subscription win Low turns it would lose at measured cost", () => {
-    // gpt-5.4 (74.4@$0.64) vs glm-5.2 (82.1@$1.84): at list cost an easy coder turn takes the cheap gpt-5.4.
-    const models = [model("gateway-codex", "gpt-5.4"), model("gateway", "glm-5.2")];
-    const coder = context("implement a typescript helper");
-    const pick = (cfg: RouterConfig) =>
-      selectFromPool(decide(coder, undefined, undefined, cfg), buildAutoPool(models, cfg), coder, undefined, cfg)?.selected.canonicalKey;
-
-    expect(pick(DEFAULT_CONFIG)).toBe("gpt-5.4");
-
-    // Price GLM as an already-paid subscription (coef 0.2 → $0.368): now it dominates and wins.
-    const withSub: RouterConfig = { ...DEFAULT_CONFIG, modelOverrides: { "gateway/glm-5.2": { costCoef: 0.2 } } };
-    expect(pick(withSub)).toBe("glm-5.2");
   });
 
   it("keeps the build-time price time-neutral and re-applies windows per turn", () => {
@@ -774,7 +744,7 @@ describe("canonical model routing", () => {
 
   it("uses time-of-day effective cost inside the selected Ramp mode", () => {
     const cfg: RouterConfig = {
-      ...DEFAULT_CONFIG,
+      ...COST_RAMP,
       modelOverrides: {
         "gateway/glm-5.2": { costCoef: 0.35, costCoefHours: [{ hours: [14, 18], factor: 3 }] },
         "gateway-codex/gpt-5.5": { costCoef: 0.6 },
@@ -799,15 +769,15 @@ describe("canonical model routing", () => {
     expect(pick(15)).toBe("gpt-5.6-sol");
   });
 
-  it("applies time-of-day repricing to forced @low mode selection", () => {
+  it("applies time-of-day repricing inside a forced mode under the cost policy", () => {
     const cfg: RouterConfig = {
-      ...DEFAULT_CONFIG,
-      modelOverrides: { "gateway/glm-5.2": { costCoef: 0.2, costCoefHours: [{ hours: [14, 18], factor: 3 }] } },
+      ...COST_RAMP,
+      modelOverrides: { "gateway/qwen3.7-plus": { costCoef: 0.2, costCoefHours: [{ hours: [14, 18], factor: 30 }] } },
     };
-    const pool = buildAutoPool([model("gateway-codex", "gpt-5.4"), model("gateway", "glm-5.2")], cfg);
+    const pool = buildAutoPool([model("gateway-codex", "gpt-5.4"), model("gateway", "qwen3.7-plus")], cfg);
     const coder = context("implement a typescript helper");
 
-    expect(selectFromPool(lowDecision(coder, cfg), pool, coder, undefined, cfg)?.selected.canonicalKey).toBe("glm-5.2");
+    expect(selectFromPool(lowDecision(coder, cfg), pool, coder, undefined, cfg)?.selected.canonicalKey).toBe("qwen3.7-plus");
     expect(selectFromPool(lowDecision(coder, cfg), repriceForTimeOfDay(pool, 15), coder, undefined, cfg)?.selected.canonicalKey).toBe("gpt-5.4");
   });
 
@@ -837,10 +807,6 @@ describe("canonical model routing", () => {
     expect(shouldReuseTurnSelection(nextUser)).toBe(false);
   });
 });
-
-function modelCost(provider: string, id: string, cost: Partial<Model<Api>["cost"]>): Model<Api> {
-  return { ...model(provider, id), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...cost } };
-}
 
 function usage(over: Partial<Usage> = {}): Usage {
   return {
@@ -882,48 +848,62 @@ describe("cache-aware stickiness", () => {
     expect(result.selection.selected.canonicalKey).toBe("qwen3.7-plus");
   });
 
-  it("switches down when warm-read savings beat the switch tax", () => {
-    const pool = buildAutoPool([model("gateway", "gpt-5.5"), modelCost("gateway", "qwen3.7-plus", { cacheWrite: 5e-7, cacheRead: 2e-7 })]);
+  it("keeps the warm model instead of downgrading or switching sideways", () => {
+    const pool = buildAutoPool([model("gateway", "gpt-5.5"), model("gateway", "qwen3.7-plus")]);
     const state = createRoutingState();
-    state.lease = { modelKey: "gateway/gpt-5.5", provider: "gateway", cost: { input: 0, cacheRead: 2e-6, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
-    state.lastUsage = usage({ totalTokens: 100_000 });
+    state.lease = { modelKey: "gateway/gpt-5.5", provider: "gateway", cost: { input: 0, cacheRead: 0, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
 
     const result = cacheAwareSelect(freshSelection(item(pool, "qwen3.7-plus")), state, pool, ctx, DEFAULT_CONFIG);
-    expect(result.cacheReason).toBe("downgrade-break-even");
-    expect(result.selection.selected.canonicalKey).toBe("qwen3.7-plus");
-  });
-
-  it("stays on the warm lease when a downgrade does not break even", () => {
-    const pool = buildAutoPool([model("gateway", "gpt-5.5"), modelCost("gateway", "qwen3.7-plus", { cacheWrite: 3e-6, cacheRead: 2e-6 })]);
-    const state = createRoutingState();
-    state.lease = { modelKey: "gateway/gpt-5.5", provider: "gateway", cost: { input: 0, cacheRead: 2e-6, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
-    state.lastUsage = usage({ totalTokens: 100_000 });
-
-    const result = cacheAwareSelect(freshSelection(item(pool, "qwen3.7-plus")), state, pool, ctx, DEFAULT_CONFIG);
-    expect(result.cacheReason).toBe("downgrade-not-worth-it");
+    expect(result.cacheReason).toBe("sticky-session");
     expect(result.selection.selected.canonicalKey).toBe("gpt-5.5");
   });
 
-  it("switches up when the capability gain is large", () => {
+  it("switches immediately when the required capability mode increases", () => {
     const pool = buildAutoPool([model("gateway", "qwen3.7-plus"), model("gateway", "gpt-5.5")]);
     const state = createRoutingState();
-    state.lease = { modelKey: "gateway/qwen3.7-plus", provider: "gateway", cost: { input: 0, cacheRead: 1e-7, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
-    state.lastUsage = usage({ totalTokens: 100_000 });
+    state.lease = { modelKey: "gateway/qwen3.7-plus", provider: "gateway", cost: { input: 0, cacheRead: 0, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
 
     const result = cacheAwareSelect(freshSelection(item(pool, "gpt-5.5")), state, pool, ctx, DEFAULT_CONFIG);
-    expect(result.cacheReason).toBe("upgrade-quality"); // +21.5 resolve points
+    expect(result.cacheReason).toBe("capability-upgrade");
     expect(result.selection.selected.canonicalKey).toBe("gpt-5.5");
   });
 
-  it("stays put when an upgrade is too small to justify the tax", () => {
-    const pool = buildAutoPool([model("gateway", "claude-opus-4-8"), model("gateway", "kimi-k2.7-code")]);
+  it("does not sacrifice a warm cache for a stronger model in the same mode", () => {
+    const pool = buildAutoPool([model("gateway", "glm-5.2"), model("gateway", "gpt-5.6-sol")]);
     const state = createRoutingState();
-    state.lease = { modelKey: "gateway/claude-opus-4-8", provider: "gateway", cost: { input: 0, cacheRead: 1e-7, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
-    state.lastUsage = usage({ totalTokens: 100_000 });
+    state.lease = { modelKey: "gateway/glm-5.2", provider: "gateway", cost: { input: 0, cacheRead: 0, cacheWrite: 0 }, warmTokens: 100_000, establishedAtTurn: 0, lastUsedTurn: 0 };
 
-    const result = cacheAwareSelect(freshSelection(item(pool, "kimi-k2.7-code")), state, pool, ctx, DEFAULT_CONFIG);
-    expect(result.cacheReason).toBe("upgrade-not-worth-it"); // only +1.2 points
-    expect(result.selection.selected.canonicalKey).toBe("claude-opus-4-8");
+    const result = cacheAwareSelect(freshSelection(item(pool, "gpt-5.6-sol")), state, pool, ctx, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("sticky-session");
+    expect(result.selection.selected.canonicalKey).toBe("glm-5.2");
+  });
+
+  it("does not retain a warm text-only model for an image request", () => {
+    const textOnly = model("gateway", "glm-5.2");
+    const vision = model("gateway", "gpt-5.6-sol");
+    vision.input = ["text", "image"];
+    const pool = buildAutoPool([textOnly, vision]);
+    const state = createRoutingState();
+    state.lease = { modelKey: "gateway/glm-5.2", provider: "gateway", cost: { input: 0, cacheRead: 0, cacheWrite: 0 }, warmTokens: 10_000, establishedAtTurn: 0, lastUsedTurn: 0 };
+    const imageContext: Context = { messages: [{ role: "user", content: [{ type: "text", text: "inspect" }, { type: "image", data: "x", mimeType: "image/png" }], timestamp: 1 }] };
+
+    const result = cacheAwareSelect(freshSelection(item(pool, "gpt-5.6-sol")), state, pool, imageContext, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("lease-ineligible");
+    expect(result.selection.selected.canonicalKey).toBe("gpt-5.6-sol");
+  });
+
+  it("does not retain a warm model after its context window is exceeded", () => {
+    const small = model("gateway", "glm-5.2");
+    small.contextWindow = 8;
+    const large = model("gateway", "gpt-5.6-sol");
+    const pool = buildAutoPool([small, large]);
+    const state = createRoutingState();
+    state.lease = { modelKey: "gateway/glm-5.2", provider: "gateway", cost: { input: 0, cacheRead: 0, cacheWrite: 0 }, warmTokens: 10_000, establishedAtTurn: 0, lastUsedTurn: 0 };
+    const longContext = context("x".repeat(200));
+
+    const result = cacheAwareSelect(freshSelection(item(pool, "gpt-5.6-sol")), state, pool, longContext, DEFAULT_CONFIG);
+    expect(result.cacheReason).toBe("lease-ineligible");
+    expect(result.selection.selected.canonicalKey).toBe("gpt-5.6-sol");
   });
 
   it("counts user turns for the switch cooldown", () => {

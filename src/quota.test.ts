@@ -36,9 +36,7 @@ function resolved(provider: string, id: string, baseUrl?: string): ResolvedModel
     model: model(provider, id, baseUrl),
     acceptsImage: false,
     canonicalKey: id,
-    costTier: "cheap",
     profiles: ["balanced"],
-    frontier: false,
     intelligence: 30,
     priceBlended: 1,
     supported: true,
@@ -48,13 +46,7 @@ function resolved(provider: string, id: string, baseUrl?: string): ResolvedModel
 }
 
 function pool(items: ResolvedModel[]): Pool {
-  return {
-    cheapPool: items.slice(0, 1),
-    standardPool: items.slice(1, 2),
-    strongPool: items.slice(2, 3),
-    unknownPool: items.slice(3),
-    all: items,
-  };
+  return { all: items };
 }
 
 describe("rate-limit header parsing", () => {

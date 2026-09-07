@@ -2,13 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Api, Context, Model, SimpleStreamOptions, ThinkingLevel, Usage } from "@earendil-works/pi-ai";
-import { CANONICAL_MODELS, findRampModels, type CanonicalMeta, type CanonicalScores, type CostTier, type ModelProfile, type RampMeta } from "./canonical-models.ts";
+import { CANONICAL_MODELS, findRampModels, type CanonicalMeta, type CanonicalScores, type ModelProfile, type RampMeta } from "./canonical-models.ts";
 import { DEFAULT_QUOTA_CONFIG, filterPoolByQuotaPlanPrefix, QuotaState, type QuotaConfig } from "./quota.ts";
 
 /**
- * Keep capability targets, effective cost, and reasoning effort independent: task difficulty sets
- * the quality floor, economics choose among qualifying variants, and benchmark effort configures the
- * selected provider call.
+ * Keep capability, cost preference, and reasoning effort independent: task difficulty selects a
+ * capability mode, policy chooses the strongest or cheapest model in that mode, and benchmark effort
+ * configures the selected provider call.
  */
 export type RouteClass = CapabilityMode | "model";
 export type Confidence = "high" | "medium" | "low";
@@ -20,8 +20,8 @@ const CAPABILITY_MODE_ORDER: CapabilityMode[] = ["low", "medium", "high", "ultra
 const MODE_SCORE_BOUNDS: [number, number][] = [[0, 0.3], [0.3, 0.52], [0.52, 0.74], [0.74, 1]];
 /** Ramp capability modes are SWE-bench solve-rate bands. */
 const RAMP_MODE_BOUNDS: [number, number][] = [[0, 75], [75, 80], [80, 85], [85, 100]];
-/** AA capability modes are Intelligence Index bands on the current frontier scale. Low is <= 41. */
-const AA_MODE_BOUNDS: [number, number][] = [[0, 41], [41, 52], [52, 56], [56, 65]];
+/** How to choose a model after the required capability mode is known. */
+export type SelectionPolicy = "quality" | "cost";
 
 /** Choose provider reasoning: auto uses its measured model-effort variant; forced models honor Pi. */
 export function routingReasoning(
@@ -39,10 +39,8 @@ const FALLBACK_PRICE = 3;
 
 export interface CanonicalResolution {
   canonical: CanonicalMeta | null;
-  costTier: CostTier;
   capabilityMode?: CapabilityMode;
   profiles: ModelProfile[];
-  frontier: boolean;
   intelligence: number;
   priceBlended: number;
   scores?: CanonicalScores;
@@ -59,13 +57,11 @@ export interface ResolvedModel {
   model: Model<Api>;
   acceptsImage: boolean;
   canonicalKey: string | null;
-  costTier: CostTier;
   capabilityMode?: CapabilityMode;
   profiles: ModelProfile[];
-  frontier: boolean;
   /** Synthetic intelligence index; capability axis for `balanced`/fallback profiles. */
   intelligence: number;
-  /** List price $/1M tokens (blended 3:1). The Pareto cost axis; NOT marginal/subscription cost. */
+  /** Effective price after personal coefficients: AA blended $/1M tokens or Ramp measured $/task. */
   priceBlended: number;
   scores?: CanonicalScores;
   tps?: number;
@@ -81,19 +77,13 @@ export interface ResolvedModel {
 }
 
 export interface Pool {
-  cheapPool: ResolvedModel[];
-  strongPool: ResolvedModel[];
-  standardPool: ResolvedModel[];
-  unknownPool: ResolvedModel[];
   all: ResolvedModel[];
 }
 
 export interface ModelOverride {
   canonical?: string;
-  costTier?: CostTier;
   capabilityMode?: CapabilityMode;
   profiles?: ModelProfile[];
-  frontier?: boolean;
   intelligence?: number;
   priceBlended?: number;
   scores?: CanonicalScores;
@@ -101,12 +91,9 @@ export interface ModelOverride {
   /** Override the benchmark-backed effort metadata for private or manually classified models. */
   benchmarkEffort?: ThinkingLevel;
   /**
-   * Shadow-price coefficient: multiplies the model's base cost-axis price (Ramp cost-per-task under
-   * `ramp`). It folds *my* economics into the shared capability frontier without touching the quality
-   * axis, and stays dimensionless so it can never put the axis into a foreign unit. <1 = cheaper to me
-   * than Ramp measured (an already-paid subscription, a discounted PAYG deal); >1 = pricier. Default 1
-   * = pure Ramp. Keep a shared/finite subscription a *positive* shadow price, not ~0: a near-zero coef
-   * makes an already-strong model dominate the whole frontier and starves the cheap PAYG floor.
+   * Multiplies the active source's base price without changing capability. Values below 1 represent
+   * a discount or prepaid subscription; values above 1 represent a personal surcharge. This mainly
+   * affects `selectionPolicy: "cost"` (and quality-policy price tie-breaks).
    */
   costCoef?: number;
   /** Time-of-day multipliers stacked on `costCoef` (e.g. GLM burns 3× quota 14:00–18:00). */
@@ -127,6 +114,7 @@ export interface ModelFilter {
 export interface RouterConfig {
   /** Which benchmark drives capability + cost. `ramp` (default) = real SWE-bench outcomes; `aa` = synthetic. Never merged. */
   capabilitySource: CapabilitySource;
+  /** @deprecated Retained for configuration compatibility; discrete capability modes do not use it. */
   threshold: number;
   weights: {
     contextTokens: number;
@@ -140,34 +128,13 @@ export interface RouterConfig {
   modelFilter: ModelFilter;
   /** User-supplied metadata for unknown/private/local models. Keys may be provider/id, model id, or normalized model id. */
   modelOverrides: Record<string, ModelOverride>;
-  /**
-   * Willingness to pay for capability, by selected mode: the max extra list-price ($/1M) spent for
-   * one more point of quality on the chosen axis. Selection walks the Pareto frontier from the
-   * cheapest point upward, taking each step whose marginal $/quality-point is within budget — so the
-   * mode signal (driven by task content) positions us on the frontier and steep low-value
-   * steps (a near-tie flagship at 2× price) are only taken at `ultra`. The single routing knob, axis-
-   * agnostic. Raise a row to climb further for that mode; `ultra: Infinity` = "top of frontier".
-   */
-  willingness: Record<CapabilityMode, number>;
-  /**
-   * Cross-turn cache stickiness. Once a model has a warm prompt cache (a "lease"), switching to a
-   * freshly-picked model pays a cache-write tax; we only switch when the economics win — cheaper warm
-   * reads on a downgrade, or enough capability gain on an upgrade. Layered on top of the Pareto pick.
-   */
-  cacheAware: {
-    enabled: boolean;
-    /** Extra USD the downgrade's read savings must beat the switch tax by, before switching down. */
-    downgradeMarginUsd: number;
-    /** Minimum capability gain (axis points: resolve-rate / intelligence) to switch up. */
-    upgradeQualityMargin: number;
-    /** USD of switch tax that counts as one required extra quality point when upgrading. */
-    upgradeTaxPenaltyScaleUsd: number;
-    /** Minimum user turns between model switches. */
-    minTurnsBetweenSwitches: number;
-  };
+  /** Within the selected capability mode, prefer the strongest model (default) or the cheapest one. */
+  selectionPolicy: SelectionPolicy;
+  /** Keep a warm model for the session; switch automatically only when the required mode increases. */
+  cacheAware: { enabled: boolean };
   quota: QuotaConfig;
   classifier: ClassifierConfig;
-  /** Explicit provider/model or variant ref for the optional LLM classifier. Empty means choose the cheapest eligible pool model. */
+  /** Exact provider/model or variant ref for the optional LLM classifier. Empty disables it. */
   classifierModel?: string;
 }
 
@@ -182,7 +149,7 @@ export interface Decision {
   cls: RouteClass;
   score: number;
   chosen: string;
-  /** Capability mode index into CAPABILITY_MODE_ORDER; sets the quality floor. */
+  /** Capability mode index into CAPABILITY_MODE_ORDER. */
   modeBucket: number;
   requestedProfile?: ModelProfile;
   reason?: string;
@@ -216,6 +183,8 @@ export interface Selection {
 export interface CacheLease {
   modelKey: string;
   provider: string;
+  /** Capability mode under which this endpoint was selected (important for cross-mode pins). */
+  capabilityMode?: CapabilityMode;
   /** Raw registry cost fields for the leased model (per-token or per-1M; normalized at use). */
   cost: { input: number; cacheRead: number; cacheWrite: number };
   warmTokens: number;
@@ -235,12 +204,10 @@ export interface RoutingState {
 export type CacheReason =
   | "disabled"
   | "no-lease"
+  | "lease-ineligible"
   | "same-model"
-  | "switch-cooldown"
-  | "downgrade-break-even"
-  | "downgrade-not-worth-it"
-  | "upgrade-quality"
-  | "upgrade-not-worth-it";
+  | "sticky-session"
+  | "capability-upgrade";
 
 export interface CacheAwareResult {
   selection: Selection;
@@ -248,15 +215,6 @@ export interface CacheAwareResult {
   taxUsd?: number;
   expectedSavingsUsd?: number;
 }
-
-/**
- * Default willingness per source. The cost axis differs by source — AA is list price ($/1M tokens,
- * ~0.5–20), Ramp is measured cost per task ($, ~0.09–2.7) — so the $/quality-point budgets are on
- * different scales and must not be shared. `loadConfig` picks the table matching `capabilitySource`
- * unless the user sets `willingness` explicitly.
- */
-export const AA_WILLINGNESS: Record<CapabilityMode, number> = { low: 0.1, medium: 0.4, high: 1.0, ultra: Infinity };
-export const RAMP_WILLINGNESS: Record<CapabilityMode, number> = { low: 0.02, medium: 0.06, high: 0.2, ultra: Infinity };
 
 export const DEFAULT_CONFIG: RouterConfig = {
   capabilitySource: "ramp",
@@ -270,14 +228,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
   modeModels: {},
   modelFilter: { include: [], exclude: [] },
   modelOverrides: {},
-  willingness: RAMP_WILLINGNESS,
-  cacheAware: {
-    enabled: true,
-    downgradeMarginUsd: 0.001,
-    upgradeQualityMargin: 3,
-    upgradeTaxPenaltyScaleUsd: 0.02,
-    minTurnsBetweenSwitches: 1,
-  },
+  selectionPolicy: "quality",
+  cacheAware: { enabled: true },
   quota: DEFAULT_QUOTA_CONFIG,
   classifier: {
     enabled: false,
@@ -310,7 +262,7 @@ function mergeRouterConfig(raw: unknown): RouterConfig {
     overrides?: RouterConfig["modelOverrides"];
   };
   const capabilitySource = router.capabilitySource === "aa" ? "aa" : "ramp";
-  const baseWillingness = capabilitySource === "aa" ? AA_WILLINGNESS : RAMP_WILLINGNESS;
+  const selectionPolicy: SelectionPolicy = router.selectionPolicy === "cost" ? "cost" : "quality";
   const rawClassifier = (router as Record<string, unknown>).classifier;
   const classifierModel = typeof (router as Record<string, unknown>).classifierModel === "string"
     ? (router as Record<string, string>).classifierModel
@@ -324,11 +276,11 @@ function mergeRouterConfig(raw: unknown): RouterConfig {
     ...DEFAULT_CONFIG,
     ...router,
     capabilitySource,
+    selectionPolicy,
     weights: { ...DEFAULT_CONFIG.weights, ...(router.weights ?? {}) },
     modeModels: { ...DEFAULT_CONFIG.modeModels, ...(router.modeModels ?? router.models ?? {}) },
     modelFilter: { ...DEFAULT_CONFIG.modelFilter, ...(router.modelFilter ?? {}) },
     modelOverrides: { ...DEFAULT_CONFIG.modelOverrides, ...(router.modelOverrides ?? router.overrides ?? {}) },
-    willingness: { ...baseWillingness, ...(router.willingness ?? {}) },
     cacheAware: { ...DEFAULT_CONFIG.cacheAware, ...(router.cacheAware ?? {}) },
     quota: { ...DEFAULT_CONFIG.quota, ...(router.quota ?? {}) },
     classifier,
@@ -418,9 +370,9 @@ export function rampCapabilityMode(resolveRate: number): CapabilityMode {
 
 /** Map AA Intelligence Index onto the same user-facing capability modes. */
 export function aaCapabilityMode(intelligence: number): CapabilityMode {
-  if (intelligence >= 56) return "ultra";
-  if (intelligence >= 52) return "high";
-  if (intelligence > 41) return "medium";
+  if (intelligence >= 52) return "ultra";
+  if (intelligence >= 47) return "high";
+  if (intelligence >= 40) return "medium";
   return "low";
 }
 
@@ -436,11 +388,6 @@ function capabilityModeForValue(value: number, bounds: readonly [number, number]
   return "low";
 }
 
-function rampCostTier(costPerTask: number): CostTier {
-  if (costPerTask < 0.4) return "cheap";
-  if (costPerTask <= 1.2) return "standard";
-  return "premium";
-}
 
 export function resolveCanonicalModel(key: string, source: CapabilitySource = "ramp"): CanonicalResolution {
   return resolveCanonicalModels(key, source)[0];
@@ -460,9 +407,7 @@ export function resolveCanonicalModels(key: string, source: CapabilitySource = "
   if (!canonical) {
     return [{
       canonical: null,
-      costTier: "unknown",
       profiles: ["balanced"],
-      frontier: false,
       intelligence: FALLBACK_INTELLIGENCE,
       priceBlended: FALLBACK_PRICE,
       supported: false,
@@ -477,9 +422,7 @@ export function resolveCanonicalModels(key: string, source: CapabilitySource = "
       // Canonical name is known, but Ramp never measured it — unsupported for auto-routing under `ramp`.
       return [{
         canonical,
-        costTier: canonical.costTier,
         profiles: canonical.profiles,
-        frontier: false,
         intelligence: FALLBACK_INTELLIGENCE,
         priceBlended: FALLBACK_PRICE,
         supported: false,
@@ -493,9 +436,7 @@ export function resolveCanonicalModels(key: string, source: CapabilitySource = "
   if (canonical.source?.startsWith("Ramp SWE-Bench")) {
     return [{
       canonical,
-      costTier: canonical.costTier,
       profiles: canonical.profiles,
-      frontier: false,
       intelligence: FALLBACK_INTELLIGENCE,
       priceBlended: FALLBACK_PRICE,
       supported: false,
@@ -506,10 +447,8 @@ export function resolveCanonicalModels(key: string, source: CapabilitySource = "
 
   return [{
     canonical,
-    costTier: canonical.costTier,
     capabilityMode: aaCapabilityMode(canonical.intelligence),
     profiles: canonical.profiles,
-    frontier: canonical.frontier,
     intelligence: canonical.intelligence,
     priceBlended: canonical.priceBlended,
     scores: canonical.scores,
@@ -526,10 +465,8 @@ function rampResolution(canonical: CanonicalMeta, ramp: RampMeta): CanonicalReso
   const scores: CanonicalScores = { coding: ramp.resolveRate, agentic: ramp.resolveRate / 100 };
   return {
     canonical,
-    costTier: rampCostTier(ramp.costPerTask),
     capabilityMode: rampCapabilityMode(ramp.resolveRate),
     profiles: canonical.profiles,
-    frontier: ramp.scoreSpendWall === true,
     intelligence: ramp.resolveRate,
     priceBlended: ramp.costPerTask,
     scores,
@@ -546,22 +483,28 @@ export function modelKey(model: Model<Api>): string {
 }
 
 export function buildAutoPool(models: Model<Api>[], cfg: RouterConfig = DEFAULT_CONFIG): Pool {
-  const all = models
+  const routableModels = models
     .filter((model) => model.provider !== "pi-router")
-    .filter((model) => model.input?.includes("text"))
+    .filter((model) => model.input?.includes("text"));
+  const all = routableModels
     .flatMap((model) => resolveModelVariants(model, cfg))
     // A model the active source has no data for (and no override) is not auto-routed.
     .filter((model) => model.supported)
-    .filter((model) => matchesModelFilter(model, cfg.modelFilter))
-    .sort(compareResolvedModels);
+    .filter((model) => matchesModelFilter(model, cfg.modelFilter));
 
-  return {
-    cheapPool: all.filter((item) => item.costTier === "cheap"),
-    standardPool: all.filter((item) => item.costTier === "standard"),
-    strongPool: all.filter((item) => item.frontier || item.costTier === "premium"),
-    unknownPool: all.filter((item) => item.costTier === "unknown"),
-    all,
-  };
+  // An explicit mode pin may refer to a private model with no benchmark metadata. Include it so the
+  // selector can honor the pin, while still applying the normal model filter and hard eligibility.
+  for (const mode of CAPABILITY_MODE_ORDER) {
+    const ref = cfg.modeModels[mode];
+    if (!ref || all.some((item) => modelRefMatches(item, ref))) continue;
+    const pinnedModel = routableModels.find((model) => modelKey(model).toLowerCase() === ref.toLowerCase());
+    if (!pinnedModel) continue;
+    const pinned = { ...resolveModel(pinnedModel, cfg), capabilityMode: mode, supported: true };
+    if (matchesModelFilter(pinned, cfg.modelFilter)) all.push(pinned);
+  }
+  all.sort((a, b) => variantKey(a).localeCompare(variantKey(b)));
+
+  return { all };
 }
 
 export function selectClassifierModel(
@@ -592,10 +535,8 @@ export function resolveModelVariants(model: Model<Api>, cfg: RouterConfig = DEFA
   const resolutions = resolveCanonicalModels(key, cfg.capabilitySource);
   const resolution = resolutions[0];
   const override = findModelOverride(cfg, key, resolution.canonical?.key ?? null);
-  // The base shadow-price coefficient folds the caller's real economics into the shared frontier: it
-  // scales whatever base cost the source/override resolved, staying dimensionless so the axis keeps one
-  // unit. Time-of-day windows are NOT folded here — they are re-applied per turn in repriceForTimeOfDay
-  // so the clock can cross a window boundary mid-session without a pool rebuild.
+  // Apply personal economics only to price. Time-of-day windows are re-applied per turn so the clock
+  // can cross a configured window boundary mid-session without rebuilding the pool.
   const coef = override?.costCoef ?? 1;
 
   if (override) {
@@ -604,10 +545,8 @@ export function resolveModelVariants(model: Model<Api>, cfg: RouterConfig = DEFA
       model,
       acceptsImage: model.input?.includes("image") ?? false,
       canonicalKey: override.canonical ?? resolution.canonical?.key ?? normalizeModelKey(key),
-      costTier: override.costTier ?? resolution.costTier,
       capabilityMode: override.capabilityMode ?? resolution.capabilityMode,
       profiles: override.profiles ?? resolution.profiles,
-      frontier: override.frontier ?? resolution.frontier,
       intelligence: override.intelligence ?? resolution.intelligence,
       priceBlended: base * coef,
       scores: override.scores ?? resolution.scores,
@@ -629,10 +568,8 @@ export function resolveModelVariants(model: Model<Api>, cfg: RouterConfig = DEFA
       model,
       acceptsImage: model.input?.includes("image") ?? false,
       canonicalKey: entry.canonical?.key ?? null,
-      costTier: entry.costTier,
       capabilityMode: entry.capabilityMode,
       profiles: entry.profiles,
-      frontier: entry.frontier,
       intelligence: entry.intelligence,
       priceBlended: base * coef,
       scores: entry.scores,
@@ -667,13 +604,7 @@ export function repriceForTimeOfDay(pool: Pool, nowHour: number): Pool {
     const mult = timeCostMultiplier(item.costCoefHours, nowHour);
     return mult === 1 ? item : { ...item, priceBlended: item.priceBlended * mult };
   };
-  return {
-    cheapPool: pool.cheapPool.map(reprice),
-    standardPool: pool.standardPool.map(reprice),
-    strongPool: pool.strongPool.map(reprice),
-    unknownPool: pool.unknownPool.map(reprice),
-    all: pool.all.map(reprice),
-  };
+  return { all: pool.all.map(reprice) };
 }
 
 /** Whether `hour` falls in the half-open window [start, end), wrapping past midnight when start > end. */
@@ -699,9 +630,17 @@ export function findModelOverride(
   const candidates = [key, key.toLowerCase(), normalizeModelKey(key), canonicalKey].filter(Boolean) as string[];
   for (const candidate of candidates) {
     const override = cfg.modelOverrides[candidate];
-    if (override) return override;
+    if (override && hasRoutingOverride(override)) return override;
   }
   return undefined;
+}
+
+function hasRoutingOverride(override: ModelOverride): boolean {
+  const recognized = new Set([
+    "canonical", "capabilityMode", "profiles", "intelligence", "priceBlended", "scores", "tps",
+    "benchmarkEffort", "costCoef", "costCoefHours",
+  ]);
+  return Object.keys(override).some((key) => recognized.has(key));
 }
 
 export function matchesModelFilter(item: ResolvedModel, filter: ModelFilter): boolean {
@@ -766,11 +705,7 @@ export function decide(
   };
 }
 
-/**
- * Continuous difficulty bucket for auto mode. The bucket drives the capability floor, so the whole
- * frontier (incl. mid-tier models) becomes reachable. Driven purely by task content: the thinking
- * level is a passthrough that controls how deeply the *chosen* model reasons, never which model is chosen.
- */
+/** Map the language-neutral task score to one of the four discrete capability modes. */
 export function autoModeBucket(score: number): number {
   return score < 0.3 ? 0 : score < 0.52 ? 1 : score < 0.74 ? 2 : 3;
 }
@@ -858,13 +793,10 @@ export function inferRequestedProfile(context: Context): ModelProfile {
   return "balanced";
 }
 
-/** Minimum intelligence a `fast`-profile pick must clear before maximizing throughput. */
-const FAST_MIN_INTELLIGENCE = 33;
-
-/** Approximate one axis from another when a model lacks the native metric (keeps the scale comparable). */
+/** Use the general index when a profile-specific sub-index is unavailable. */
 export function axisValue(item: ResolvedModel, profile: ModelProfile): number {
-  if (profile === "coder") return item.scores?.coding ?? item.intelligence + 15;
-  if (profile === "deep") return item.scores?.agentic != null ? item.scores.agentic * 100 : item.intelligence + 24;
+  if (profile === "coder") return item.scores?.coding ?? item.intelligence;
+  if (profile === "deep") return item.scores?.agentic != null ? item.scores.agentic * 100 : item.intelligence;
   return item.intelligence; // balanced / vision / fallback
 }
 
@@ -883,140 +815,32 @@ function eligibleModels(pool: Pool, context: Context): { eligible: ResolvedModel
   return withinWindow.length > 0 ? { eligible: withinWindow, overflow: false } : { eligible: visionOk, overflow: true };
 }
 
-/**
- * Capability Pareto frontier on (quality, list price): keep a model only if no other is at least as
- * capable AND no more expensive (strictly better on one). Dominated models — dumber *and* pricier —
- * are strict waste and never selected. This replaces the old hard-coded scoreCandidate.
- */
-export function paretoFrontier(items: ResolvedModel[], profile: ModelProfile): ResolvedModel[] {
-  return items.filter((a) => {
-    const qa = axisValue(a, profile);
-    return !items.some((b) => {
-      if (b === a) return false;
-      const qb = axisValue(b, profile);
-      return qb >= qa && b.priceBlended <= a.priceBlended && (qb > qa || b.priceBlended < a.priceBlended);
-    });
-  });
-}
-
-/**
- * The frontier as a monotone chain, cheapest+weakest → priciest+strongest, with equal-(quality,price)
- * duplicates collapsed deterministically. This is the ordered set of operating points to climb.
- */
-export function frontierChain(items: ResolvedModel[], profile: ModelProfile): ResolvedModel[] {
-  const sorted = [...paretoFrontier(items, profile)].sort(
-    (a, b) =>
-      axisValue(a, profile) - axisValue(b, profile) ||
-      a.priceBlended - b.priceBlended ||
-      modelKey(a.model).localeCompare(modelKey(b.model)),
-  );
-  const chain: ResolvedModel[] = [];
-  for (const item of sorted) {
-    const prev = chain.at(-1);
-    if (
-      prev &&
-      axisValue(prev, profile) === axisValue(item, profile) &&
-      prev.priceBlended === item.priceBlended &&
-      variantKey(prev) === variantKey(item)
-    ) continue;
-    chain.push(item);
-  }
-  return chain;
-}
-
-/** Walk the frontier upward, taking each step whose marginal $/quality-point is within budget. */
-function climbFrontier(chain: ResolvedModel[], profile: ModelProfile, willingness: number): ResolvedModel {
-  let pick = chain[0];
-  for (let i = 1; i < chain.length; i++) {
-    const dq = axisValue(chain[i], profile) - axisValue(pick, profile);
-    const dp = chain[i].priceBlended - pick.priceBlended;
-    if (dq > 0 && dp / dq > willingness) break;
-    pick = chain[i];
-  }
-  return pick;
-}
-
-function capabilityModeTarget(decision: Decision, cfg: RouterConfig): { mode: CapabilityMode; floor: number; position: number } {
-  const bucket = Math.max(0, Math.min(CAPABILITY_MODE_ORDER.length - 1, Math.trunc(decision.modeBucket)));
-  const [scoreLow, scoreHigh] = MODE_SCORE_BOUNDS[bucket];
-  const score = Number.isFinite(decision.score) ? decision.score : scoreLow;
-  const position = (Math.max(scoreLow, Math.min(scoreHigh, score)) - scoreLow) / (scoreHigh - scoreLow);
-  const bounds = cfg.capabilitySource === "aa" ? AA_MODE_BOUNDS : RAMP_MODE_BOUNDS;
-  const [floorLow, floorHigh] = bounds[bucket];
-  return {
-    mode: CAPABILITY_MODE_ORDER[bucket],
-    floor: floorLow + position * (floorHigh - floorLow),
-    position,
-  };
-}
-
-function cheapestMeetingFloor(items: ResolvedModel[], floor: number): ResolvedModel | undefined {
-  return [...items]
-    .filter((item) => item.intelligence >= floor)
-    .sort((a, b) =>
-      a.priceBlended - b.priceBlended ||
-      b.intelligence - a.intelligence ||
-      modelKey(a.model).localeCompare(modelKey(b.model)),
-    )[0];
-}
-
-function finiteWillingness(cfg: RouterConfig, mode: CapabilityMode): number {
-  const configured = cfg.willingness[mode];
-  if (Number.isFinite(configured)) return Math.max(0, configured);
-  return Math.max(0, ...Object.values(cfg.willingness).filter(Number.isFinite));
-}
-
-function climbWithinMode(base: ResolvedModel, items: ResolvedModel[], willingness: number): ResolvedModel {
-  let pick = base;
-  const stronger = items
-    .filter((item) => item.intelligence > base.intelligence)
-    .sort((a, b) => a.intelligence - b.intelligence || a.priceBlended - b.priceBlended);
-  for (const item of stronger) {
-    const qualityGain = item.intelligence - pick.intelligence;
-    const priceIncrease = item.priceBlended - pick.priceBlended;
-    if (qualityGain > 0 && priceIncrease / qualityGain > willingness) break;
-    pick = item;
-  }
-  return pick;
-}
-
-/**
- * Prefer Ramp's published score-versus-spend wall only when its marginal capability remains inside
- * the mode's economic budget. The user's filtered pool and effective prices run first, so a wall
- * model that is unavailable or dominated under local economics never blocks a viable measured row.
- */
-function preferRampScoreSpendWall(base: ResolvedModel, items: ResolvedModel[], willingness: number): ResolvedModel {
-  if (base.frontier) return base;
-  const wallUpgrades = items
-    .filter((item) => item.frontier && item.intelligence >= base.intelligence)
-    .sort((a, b) => a.intelligence - b.intelligence || a.priceBlended - b.priceBlended);
-
-  for (const item of wallUpgrades) {
-    const qualityGain = item.intelligence - base.intelligence;
-    const priceIncrease = item.priceBlended - base.priceBlended;
-    if (priceIncrease <= 0 || (qualityGain > 0 && priceIncrease / qualityGain <= willingness)) return item;
-  }
-  return base;
-}
-
-function nearestModeFallback(items: ResolvedModel[], targetMode: CapabilityMode): ResolvedModel | undefined {
+function nearestModeCandidates(items: ResolvedModel[], targetMode: CapabilityMode): ResolvedModel[] {
   const targetRank = CAPABILITY_MODE_ORDER.indexOf(targetMode);
   const ranked = items
     .map((item) => ({ item, rank: item.capabilityMode ? CAPABILITY_MODE_ORDER.indexOf(item.capabilityMode) : -1 }))
     .filter(({ rank }) => rank >= 0);
   const strongerRank = Math.min(...ranked.filter(({ rank }) => rank > targetRank).map(({ rank }) => rank));
-  if (Number.isFinite(strongerRank)) {
-    return ranked
-      .filter(({ rank }) => rank === strongerRank)
-      .map(({ item }) => item)
-      .sort((a, b) => a.priceBlended - b.priceBlended || b.intelligence - a.intelligence)[0];
-  }
-
+  if (Number.isFinite(strongerRank)) return ranked.filter(({ rank }) => rank === strongerRank).map(({ item }) => item);
   const weakerRank = Math.max(...ranked.filter(({ rank }) => rank < targetRank).map(({ rank }) => rank));
-  return ranked
-    .filter(({ rank }) => rank === weakerRank)
-    .map(({ item }) => item)
-    .sort((a, b) => b.intelligence - a.intelligence || a.priceBlended - b.priceBlended)[0];
+  return Number.isFinite(weakerRank)
+    ? ranked.filter(({ rank }) => rank === weakerRank).map(({ item }) => item)
+    : [];
+}
+
+function modelRefMatches(item: ResolvedModel, ref: string): boolean {
+  const normalized = ref.toLowerCase();
+  return modelKey(item.model).toLowerCase() === normalized ||
+    variantKey(item).toLowerCase() === normalized ||
+    item.canonicalKey?.toLowerCase() === normalized;
+}
+
+function selectByPolicy(items: ResolvedModel[], profile: ModelProfile, policy: SelectionPolicy): ResolvedModel {
+  const capability = (item: ResolvedModel) => profile === "fast" ? (item.tps ?? 0) : axisValue(item, profile);
+  return [...items].sort((a, b) => policy === "cost"
+    ? a.priceBlended - b.priceBlended || capability(b) - capability(a) || modelKey(a.model).localeCompare(modelKey(b.model))
+    : capability(b) - capability(a) || a.priceBlended - b.priceBlended || modelKey(a.model).localeCompare(modelKey(b.model))
+  )[0];
 }
 
 export function selectFromPool(
@@ -1030,63 +854,29 @@ export function selectFromPool(
   const { eligible, overflow } = eligibleModels(pool, context);
   if (eligible.length === 0) return undefined;
 
-  const bucket = decision.modeBucket;
-  const selectedMode = CAPABILITY_MODE_ORDER[Math.max(0, Math.min(CAPABILITY_MODE_ORDER.length - 1, bucket))];
-
-  // `fast` is orthogonal: gate on a low capability floor, then maximize throughput.
-  if (profile === "fast") {
-    const usable = eligible.filter((item) => item.intelligence >= FAST_MIN_INTELLIGENCE);
-    const pickFrom = usable.length > 0 ? usable : eligible;
-    const selected = [...pickFrom].sort((a, b) =>
-      (b.tps ?? 0) - (a.tps ?? 0) ||
-      a.priceBlended - b.priceBlended ||
-      b.intelligence - a.intelligence ||
-      modelKey(a.model).localeCompare(modelKey(b.model)),
-    )[0];
-    return buildSelection(selected, eligible, profile, `fast: top throughput${overflowNote(overflow)}`);
+  const bucket = Math.max(0, Math.min(CAPABILITY_MODE_ORDER.length - 1, decision.modeBucket));
+  const targetMode = CAPABILITY_MODE_ORDER[bucket];
+  const pinnedRef = cfg.modeModels[targetMode];
+  const pinned = pinnedRef ? eligible.find((item) => modelRefMatches(item, pinnedRef)) : undefined;
+  if (pinned) {
+    const selected = { ...pinned, capabilityMode: targetMode };
+    return buildSelection(selected, eligible, profile, `${targetMode}/pinned: ${pinnedRef}${overflowNote(overflow)}`);
   }
 
-  // First remove strictly dominated variants; every later choice stays on this economic frontier.
-  const chain = frontierChain(eligible, profile);
-
-  // Task difficulty maps to Low/Medium/High/Ultra, then spends only on affordable upgrades inside
-  // that mode. Ramp uses solve rate as the floor; AA uses Intelligence Index thresholds.
-  const target = capabilityModeTarget(decision, cfg);
-  const sameMode = chain.filter((item) => item.capabilityMode === target.mode);
-  if (sameMode.length > 0) {
-    const base = cheapestMeetingFloor(sameMode, target.floor) ?? [...sameMode].sort((a, b) =>
-      b.intelligence - a.intelligence ||
-      a.priceBlended - b.priceBlended ||
-      modelKey(a.model).localeCompare(modelKey(b.model)),
-    )[0];
-    const preferredBase = cfg.capabilitySource === "ramp"
-      ? preferRampScoreSpendWall(base, sameMode, finiteWillingness(cfg, selectedMode))
-      : base;
-    const willingness = finiteWillingness(cfg, selectedMode) * target.position;
-    const selected = climbWithinMode(preferredBase, sameMode, willingness);
-    const axisLabel = cfg.capabilitySource === "aa" ? "AA floor" : "solve floor";
-    const wallNote = preferredBase !== base ? " wall-priority" : "";
-    const reason = `${target.mode}${wallNote} ${axisLabel}≥${target.floor.toFixed(1)} w≤$${willingness.toFixed(3)}/pt → ${selected.intelligence.toFixed(1)}@$${selected.priceBlended}${overflowNote(overflow)}`;
-    return buildSelection(selected, chain, profile, reason);
-  }
-
-  const selectedByMode = nearestModeFallback(chain, target.mode);
-  if (selectedByMode) {
-    const reason = `${target.mode} unavailable → ${selectedByMode.capabilityMode} ${selectedByMode.intelligence.toFixed(1)}@$${selectedByMode.priceBlended}${overflowNote(overflow)}`;
-    return buildSelection(selectedByMode, chain, profile, reason);
-  }
-
-  const willingness = cfg.willingness[selectedMode];
-  const selected = climbFrontier(chain, profile, willingness);
-
-  const budget = willingness === Infinity ? "∞" : willingness.toString();
-  const reason = `${selectedMode}/${profile} w≤$${budget}/pt → ${axisValue(selected, profile).toFixed(0)}@$${selected.priceBlended}${overflowNote(overflow)}`;
-  return buildSelection(selected, chain, profile, reason);
+  const exact = eligible.filter((item) => item.capabilityMode === targetMode);
+  const candidates = exact.length > 0 ? exact : nearestModeCandidates(eligible, targetMode);
+  const pickFrom = candidates.length > 0 ? candidates : eligible;
+  const selected = selectByPolicy(pickFrom, profile, cfg.selectionPolicy);
+  const actualMode = selected.capabilityMode ?? "unknown";
+  const fallback = actualMode === targetMode ? "" : `; ${targetMode} unavailable → ${actualMode}`;
+  const metric = profile === "fast" ? `${(selected.tps ?? 0).toFixed(0)} tps` : `${axisValue(selected, profile).toFixed(1)} capability`;
+  const reason = `${targetMode}/${cfg.selectionPolicy}: ${metric}@$${selected.priceBlended}${fallback}${overflowNote(overflow)}`;
+  return buildSelection(selected, pickFrom, profile, reason);
 }
 
 function buildSelection(
   selected: ResolvedModel,
-  frontier: ResolvedModel[],
+  candidates: ResolvedModel[],
   profile: ModelProfile,
   reason: string,
 ): Selection {
@@ -1095,7 +885,7 @@ function buildSelection(
     profile,
     benchmarkEffort: selected.benchmarkEffort,
     reason,
-    alternatives: frontier.filter((item) => item !== selected).map(variantKey),
+    alternatives: candidates.filter((item) => variantKey(item) !== variantKey(selected)).map(variantKey),
   };
 }
 
@@ -1104,8 +894,8 @@ function overflowNote(overflow: boolean): string {
 }
 
 // ── Cross-turn cache-aware stickiness ────────────────────────────────────────
-// Layered on top of the Pareto pick. The Pareto pass says which model best fits this turn's
-// selected mode; this pass asks whether a warm cache lease is worth keeping instead of switching to it.
+// Session stickiness is intentionally asymmetric: keep the warm model for the same or a lower mode,
+// and sacrifice its cache only when the required capability mode increases.
 
 export function createRoutingState(): RoutingState {
   return { lastSwitchTurn: Number.NEGATIVE_INFINITY, observedCacheReadRatio: 0, realizedCostByModel: {} };
@@ -1116,15 +906,7 @@ export function userTurnIndex(context: Context): number {
   return context.messages.reduce((count, message) => (message.role === "user" ? count + 1 : count), 0);
 }
 
-/** Normalize a registry cost field to USD-per-token, tolerating per-token or per-1M conventions. */
-function costPerTokenUsd(cost: number): number {
-  return cost >= 0.001 ? cost / 1_000_000 : cost;
-}
-
-/**
- * Given the fresh Pareto selection, decide whether to keep the warm lease instead. Returns the fresh
- * pick when there is no lease, when the fresh pick already is the lease, or when an economic switch wins.
- */
+/** Keep the current model sticky; automatically switch only for a higher capability mode. */
 export function cacheAwareSelect(
   fresh: Selection,
   state: RoutingState,
@@ -1136,53 +918,28 @@ export function cacheAwareSelect(
 
   const lease = state.lease;
   const leaseItem = lease ? pool.all.find((item) => modelKey(item.model) === lease.modelKey) : undefined;
-  // No warm lease, or the leased model is no longer eligible (deauthed / cooled down) → take the fresh pick.
   if (!lease || !leaseItem) return { selection: fresh, cacheReason: "no-lease" };
+  const needsImage = contextHasImage(context);
+  const exceedsWindow = Boolean(leaseItem.model.contextWindow && estimateContextTokens(context) > leaseItem.model.contextWindow);
+  if ((needsImage && !leaseItem.acceptsImage) || exceedsWindow) {
+    return { selection: fresh, cacheReason: "lease-ineligible" };
+  }
   if (modelKey(fresh.selected.model) === lease.modelKey) return { selection: fresh, cacheReason: "same-model" };
 
-  const profile = fresh.profile;
-  const stay = leaseSelection(leaseItem, fresh, profile);
-
-  if (userTurnIndex(context) - state.lastSwitchTurn < cfg.cacheAware.minTurnsBetweenSwitches) {
-    return { selection: { ...stay, reason: "cache-stay: switch cooldown" }, cacheReason: "switch-cooldown" };
-  }
-
-  const contextTokens = state.lastUsage && state.lastUsage.totalTokens > 0 ? state.lastUsage.totalTokens : estimateContextTokens(context);
-  const taxUsd = switchTaxUsd(contextTokens, lease, fresh.selected);
-  const qLease = axisValue(leaseItem, profile);
-  const qFresh = axisValue(fresh.selected, profile);
-
-  if (qFresh <= qLease) {
-    const expectedSavingsUsd = expectedDowngradeSavingsUsd(contextTokens, lease, fresh.selected, state);
-    if (expectedSavingsUsd >= Math.max(0, taxUsd) + cfg.cacheAware.downgradeMarginUsd) {
-      return {
-        selection: { ...fresh, reason: `${fresh.reason}; downgrade saves ${formatUsd(expectedSavingsUsd)} > tax ${formatUsd(taxUsd)}` },
-        cacheReason: "downgrade-break-even",
-        taxUsd,
-        expectedSavingsUsd,
-      };
-    }
+  const leaseMode = lease.capabilityMode ?? leaseItem.capabilityMode;
+  const leaseRank = leaseMode ? CAPABILITY_MODE_ORDER.indexOf(leaseMode) : -1;
+  const freshRank = fresh.selected.capabilityMode ? CAPABILITY_MODE_ORDER.indexOf(fresh.selected.capabilityMode) : -1;
+  if (freshRank > leaseRank) {
     return {
-      selection: { ...stay, reason: `cache-stay: downgrade saves ${formatUsd(expectedSavingsUsd)} < tax ${formatUsd(taxUsd)}` },
-      cacheReason: "downgrade-not-worth-it",
-      taxUsd,
-      expectedSavingsUsd,
+      selection: { ...fresh, reason: `${fresh.reason}; capability upgrade ${leaseMode ?? "unknown"}→${fresh.selected.capabilityMode ?? "unknown"}` },
+      cacheReason: "capability-upgrade",
     };
   }
 
-  const gain = qFresh - qLease;
-  const taxPenalty = Math.max(0, taxUsd) / Math.max(cfg.cacheAware.upgradeTaxPenaltyScaleUsd, 1e-6);
-  if (gain >= cfg.cacheAware.upgradeQualityMargin + taxPenalty) {
-    return {
-      selection: { ...fresh, reason: `${fresh.reason}; upgrade +${gain.toFixed(0)}pt covers tax` },
-      cacheReason: "upgrade-quality",
-      taxUsd,
-    };
-  }
+  const stay = leaseSelection({ ...leaseItem, capabilityMode: leaseMode }, fresh, fresh.profile);
   return {
-    selection: { ...stay, reason: `cache-stay: upgrade +${gain.toFixed(0)}pt below margin` },
-    cacheReason: "upgrade-not-worth-it",
-    taxUsd,
+    selection: { ...stay, reason: `sticky session: keep ${leaseMode ?? "unknown"} model` },
+    cacheReason: "sticky-session",
   };
 }
 
@@ -1211,6 +968,7 @@ export function recordRoutingUsage(state: RoutingState, selected: ResolvedModel,
   state.lease = {
     modelKey: key,
     provider: selected.model.provider,
+    capabilityMode: selected.capabilityMode,
     cost: { input: selected.model.cost.input, cacheRead: selected.model.cost.cacheRead, cacheWrite: selected.model.cost.cacheWrite },
     warmTokens: totalPromptTokens,
     establishedAtTurn: state.lease?.modelKey === key ? state.lease.establishedAtTurn : turn,
@@ -1218,26 +976,8 @@ export function recordRoutingUsage(state: RoutingState, selected: ResolvedModel,
   };
 }
 
-/** Switching pays a cache-write on the candidate instead of re-reading the warm lease. */
-function switchTaxUsd(contextTokens: number, lease: CacheLease, candidate: ResolvedModel): number {
-  const stayCost = contextTokens * costPerTokenUsd(lease.cost.cacheRead);
-  const switchCost = contextTokens * costPerTokenUsd(candidate.model.cost.cacheWrite);
-  return switchCost - stayCost;
-}
-
-/** Downgrading earns cheaper warm reads for the rest of the domain. */
-function expectedDowngradeSavingsUsd(contextTokens: number, lease: CacheLease, candidate: ResolvedModel, state: RoutingState): number {
-  const warmTokens = Math.max(contextTokens * state.observedCacheReadRatio, lease.warmTokens);
-  const readDelta = Math.max(0, costPerTokenUsd(lease.cost.cacheRead) - costPerTokenUsd(candidate.model.cost.cacheRead));
-  return warmTokens * readDelta;
-}
-
 function movingAverage(previous: number, next: number, weight: number): number {
   return previous === 0 ? next : previous * (1 - weight) + next * weight;
-}
-
-function formatUsd(value: number): string {
-  return `$${value.toFixed(6)}`;
 }
 
 export function contextHasImage(context: Context): boolean {
@@ -1302,16 +1042,6 @@ export function estimateContextTokens(context: Context): number {
   return Math.ceil(chars / 4);
 }
 
-function resolveCostRank(tier: CostTier): number {
-  if (tier === "cheap") return 0;
-  if (tier === "standard") return 1;
-  if (tier === "premium") return 2;
-  return 3;
-}
-
-function compareResolvedModels(a: ResolvedModel, b: ResolvedModel): number {
-  return resolveCostRank(a.costTier) - resolveCostRank(b.costTier) || variantKey(a).localeCompare(variantKey(b));
-}
 
 export function variantKey(item: ResolvedModel): string {
   return item.benchmarkEffort ? `${modelKey(item.model)}@${item.benchmarkEffort}` : modelKey(item.model);

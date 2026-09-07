@@ -190,14 +190,7 @@ export function filterPoolByQuota(
     const planKey = planKeyFor(item);
     return !excluded.has(planKey) && quota.isAvailable(planKey, now);
   };
-  const filter = (items: ResolvedModel[]) => items.filter(keep);
-  const next: Pool = {
-    cheapPool: filter(pool.cheapPool),
-    standardPool: filter(pool.standardPool),
-    strongPool: filter(pool.strongPool),
-    unknownPool: filter(pool.unknownPool),
-    all: filter(pool.all),
-  };
+  const next: Pool = { all: pool.all.filter(keep) };
 
   return next.all.length === 0 ? pool : next;
 }
@@ -210,14 +203,7 @@ export function filterPoolByQuotaPlanPrefix(pool: Pool, quota: QuotaState | unde
     quotaPlanPrefix(item.model.provider, item.model.baseUrl),
     now,
   );
-  const filter = (items: ResolvedModel[]) => items.filter(keep);
-  const next: Pool = {
-    cheapPool: filter(pool.cheapPool),
-    standardPool: filter(pool.standardPool),
-    strongPool: filter(pool.strongPool),
-    unknownPool: filter(pool.unknownPool),
-    all: filter(pool.all),
-  };
+  const next: Pool = { all: pool.all.filter(keep) };
   return next.all.length === 0 ? pool : next;
 }
 

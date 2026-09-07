@@ -1,7 +1,7 @@
 {
   "name": "pi-model-auto",
   "version": "0.2.2",
-  "description": "Pi extension package that routes each turn by Low/Medium/High/Ultra capability modes.",
+  "description": "Capability-mode model router for Pi with quality/cost selection and sticky sessions.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

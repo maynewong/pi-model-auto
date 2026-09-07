@@ -1,6 +1,6 @@
 {
   "name": "pi-model-auto",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Capability-mode model router for Pi with quality/cost selection and sticky sessions.",
   "type": "module",
   "exports": {
